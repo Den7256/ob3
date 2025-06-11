@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import datetime
 import sqlite3
@@ -9,6 +10,12 @@ from flask_httpauth import HTTPBasicAuth
 from werkzeug.utils import secure_filename
 from ldap3 import Server, Connection, ALL, NTLM, SIMPLE
 from sqlalchemy import func, desc
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import relationship
+from flask import abort
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask import copy_current_request_context
+
 
 # Игнорируем предупреждения об устаревших методах
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -70,11 +77,12 @@ class Post(db.Model):
 
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    content = db.Column(db.Text, nullable=False)
+    content = db.Column(db.Text, nullable=True)  # Может быть пустым, если только файл
     timestamp = db.Column(db.DateTime, index=True, default=datetime.datetime.now)
     sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     recipient_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     is_read = db.Column(db.Boolean, default=False)
+    files = db.relationship('File', backref='message', lazy=True)  # Связь с файлами
     sender = db.relationship('User', foreign_keys=[sender_id], backref=db.backref('sent_messages', lazy=True))
     recipient = db.relationship('User', foreign_keys=[recipient_id], backref=db.backref('received_messages', lazy=True))
 
@@ -84,7 +92,18 @@ class File(db.Model):
     filename = db.Column(db.String(255), nullable=False)
     upload_date = db.Column(db.DateTime, default=datetime.datetime.now)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    message_id = db.Column(db.Integer, db.ForeignKey('message.id'), nullable=True)  # Связь с сообщением
     user = db.relationship('User', backref=db.backref('files', lazy=True))
+
+    @property
+    def filepath(self):
+        return os.path.join(app.config['UPLOAD_FOLDER'], self.filename)
+
+    @property
+    def filesize(self):
+        if os.path.exists(self.filepath):
+            return os.path.getsize(self.filepath)
+        return 0
 
 
 # Гарантированное создание/обновление схемы БД
@@ -93,13 +112,12 @@ def init_database():
         # Создаем все таблицы, если их нет
         db.create_all()
 
-        # Проверяем существующие столбцы в таблице message
+        # Проверяем существующие столбцы
         inspector = db.inspect(db.engine)
 
+        # Для таблицы message
         if 'message' in inspector.get_table_names():
             columns = [col['name'] for col in inspector.get_columns('message')]
-
-            # Добавляем отсутствующие столбцы
             if 'is_read' not in columns:
                 try:
                     with db.engine.begin() as connection:
@@ -107,6 +125,17 @@ def init_database():
                     app.logger.info("Added column: is_read to message")
                 except Exception as e:
                     app.logger.error(f"Error adding column is_read: {str(e)}")
+
+        # Для таблицы file
+        if 'file' in inspector.get_table_names():
+            columns = [col['name'] for col in inspector.get_columns('file')]
+            if 'message_id' not in columns:
+                try:
+                    with db.engine.begin() as connection:
+                        connection.execute("ALTER TABLE file ADD COLUMN message_id INTEGER")
+                    app.logger.info("Added column: message_id to file")
+                except Exception as e:
+                    app.logger.error(f"Error adding column message_id: {str(e)}")
 
         app.logger.info("Database schema initialized")
 
@@ -346,6 +375,20 @@ def cleanup_old_files():
         app.logger.info(f"Cleaned up {len(old_files)} old files")
 
 
+@app.template_filter('filesizeformat')
+def filesizeformat_filter(value):
+    """Форматирует размер файла в читаемый вид"""
+    if value is None:
+        return "0 B"
+
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if abs(value) < 1024.0:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TB"
+
+
+
 # Routes
 @app.route('/')
 @auth.login_required
@@ -385,18 +428,37 @@ def chat(user_id):
     recipient = User.query.get_or_404(user_id)
 
     if request.method == 'POST':
-        content = request.form.get('content')
-        if content:
-            message = Message(
-                content=content,
-                sender_id=session['user_id'],
-                recipient_id=user_id,
-                is_read=False
-            )
-            db.session.add(message)
-            db.session.commit()
+        content = request.form.get('content', '')
 
-    # Помечаем все сообщения от этого пользователя как прочитанные
+        # Создаем сообщение
+        message = Message(
+            content=content,
+            sender_id=session['user_id'],
+            recipient_id=user_id,
+            is_read=False
+        )
+        db.session.add(message)
+        db.session.flush()  # Получаем ID сообщения перед коммитом
+
+        # Обработка файлов
+        if 'file' in request.files:
+            file = request.files['file']
+            if file.filename != '':
+                filename = file.filename  # Оригинальное имя с кириллицей
+                safe_filename = secure_filename(filename)  # Безопасное имя для хранения и путей
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
+                file.save(filepath)
+
+                new_file = File(
+                    filename=filename,  # сохраняем оригинальное имя
+                    user_id=session['user_id'],
+                    message_id=message.id
+                )
+                db.session.add(new_file)
+
+        db.session.commit()
+
+    # Помечаем сообщения как прочитанные
     Message.query.filter_by(
         sender_id=user_id,
         recipient_id=session['user_id'],
@@ -404,6 +466,7 @@ def chat(user_id):
     ).update({'is_read': True})
     db.session.commit()
 
+    # Получаем все сообщения
     messages = Message.query.filter(
         ((Message.sender_id == session['user_id']) & (Message.recipient_id == user_id)) |
         ((Message.sender_id == user_id) & (Message.recipient_id == session['user_id']))
@@ -459,40 +522,84 @@ def inbox():
     return render_template('inbox.html', conversations=conversations, unread_counts=unread_counts)
 
 
-@app.route('/upload', methods=['POST'])
+@app.route('/upload/<int:recipient_id>', methods=['POST'])
 @auth.login_required
-def upload_file():
+def upload_file(recipient_id):
+    """Отдельный роут для загрузки файлов в чате"""
     if 'file' not in request.files:
-        return redirect(request.referrer)
+        return redirect(url_for('chat', user_id=recipient_id))
 
     file = request.files['file']
     if file.filename == '':
-        return redirect(request.referrer)
+        return redirect(url_for('chat', user_id=recipient_id))
 
-    if file:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+    # Создаем сообщение только для файла
+    message = Message(
+        content="",
+        sender_id=session['user_id'],
+        recipient_id=recipient_id,
+        is_read=False
+    )
+    db.session.add(message)
+    db.session.flush()  # Получаем ID сообщения
 
-        new_file = File(
-            filename=filename,
-            user_id=session['user_id']
-        )
-        db.session.add(new_file)
-        db.session.commit()
+    filename = file.filename
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
 
-    return redirect(request.referrer)
+    new_file = File(
+        filename=filename,
+        user_id=session['user_id'],
+        message_id=message.id  # Связываем файл с сообщением
+    )
+    db.session.add(new_file)
+    db.session.commit()
+
+    return redirect(url_for('chat', user_id=recipient_id))
 
 
 @app.route('/download/<int:file_id>')
 @auth.login_required
 def download_file(file_id):
-    file = File.query.get_or_404(file_id)
-    return send_from_directory(
-        app.config['UPLOAD_FOLDER'],
-        file.filename,
-        as_attachment=True
-    )
+    try:
+        file = File.query.get_or_404(file_id)
+        message = file.message  # Связанное сообщение
+
+        # Проверяем права доступа:
+        # 1. Отправитель файла
+        # 2. Получатель сообщения
+        # 3. Администратор
+        allowed = False
+
+        if file.user_id == session['user_id']:
+            allowed = True  # Отправитель файла
+
+        elif message and message.recipient_id == session['user_id']:
+            allowed = True  # Получатель сообщения
+
+        elif session.get('is_admin'):
+            allowed = True  # Администратор
+
+        if not allowed:
+            app.logger.warning(f"Access denied to file {file_id} for user {session['user_id']}")
+            return "Forbidden", 403
+
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+
+        if not os.path.exists(file_path):
+            app.logger.error(f"File not found: {file_path}")
+            return "File not found", 404
+
+        app.logger.info(f"Serving file: {file.filename} to user {session['user_id']}")
+        return send_from_directory(
+            app.config['UPLOAD_FOLDER'],
+            file.filename,
+            as_attachment=True,
+            download_name=file.filename  # Указываем имя для скачивания
+        )
+    except Exception as e:
+        app.logger.error(f"Error downloading file {file_id}: {str(e)}")
+        return "Internal server error", 500
 
 
 @app.route('/admin')
@@ -519,6 +626,8 @@ def init_app():
 
     # Очистка старых файлов в контексте приложения
     with app.app_context():
+        db.create_all()
+        init_database()
         cleanup_old_files()
 
 

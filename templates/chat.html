@@ -29,9 +29,27 @@
                         <div class="{% if message.sender_id == current_user.id %}sent-message{% else %}received-message{% endif %}">
                             <div class="d-flex justify-content-between mb-1">
                                 <small><strong>{{ message.sender.fullname }}</strong></small>
-                                <small>{{ message.timestamp.strftime('%H:%M') }}</small>
+                                <small>{{ message.timestamp.strftime('%d.%m.%Y %H:%M') }}</small>
                             </div>
-                            <p class="mb-0">{{ message.content }}</p>
+
+                            {% if message.content %}
+                            <p class="mb-2">{{ message.content }}</p>
+                            {% endif %}
+
+                            {% for file in message.files %}
+                            <div class="mb-2">
+                                <div class="d-flex align-items-center">
+                                    <i class="bi bi-file-earmark me-2"></i>
+                                    <div>
+                                        <div class="fw-bold">{{ file.filename }}</div>
+                                        <small class="text-muted">
+                                            {{ (file.filesize|default(0))|filesizeformat }} -
+                                            <a href="{{ url_for('download_file', file_id=file.id) }}">Скачать</a>
+                                        </small>
+                                    </div>
+                                </div>
+                            </div>
+                            {% endfor %}
 
                             {% if not message.is_read and message.sender_id == current_user.id %}
                             <small class="text-muted d-block text-end">
@@ -53,16 +71,16 @@
                 <form method="POST" action="{{ url_for('chat', user_id=recipient.id) }}">
                     <div class="input-group mb-3">
                         <textarea class="form-control" name="content" rows="2"
-                                 placeholder="Введите сообщение..." required></textarea>
+                                 placeholder="Введите сообщение..."></textarea>
                         <button class="btn btn-primary" type="submit">
                             <i class="bi bi-send"></i>
                         </button>
                     </div>
                 </form>
 
-                <form method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data">
+                <form method="POST" action="{{ url_for('upload_file', recipient_id=recipient.id) }}" enctype="multipart/form-data">
                     <div class="input-group">
-                        <input type="file" class="form-control" name="file">
+                        <input type="file" class="form-control" name="file" required>
                         <button class="btn btn-outline-secondary" type="submit">
                             <i class="bi bi-paperclip"></i> Прикрепить файл
                         </button>
