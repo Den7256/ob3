@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Лента новостей{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-8 mx-auto">
+        <div class="card post-card mb-4">
+            <div class="card-body">
+                <h5 class="card-title">Новая запись</h5>
+                <form method="POST" action="{{ url_for('create_post') }}">
+                    <div class="mb-3">
+                        <textarea class="form-control" name="content" rows="3"
+                                  placeholder="Что у вас нового?" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-send"></i> Опубликовать
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <h4 class="mb-3">Последние обновления</h4>
+
+        {% for post in posts %}
+        <div class="card post-card">
+            <div class="card-body">
+                <div class="d-flex align-items-center mb-3">
+                    <div class="user-avatar me-3">
+                        <i class="bi bi-person-fill"></i>
+                    </div>
+                    <div>
+                        <h6 class="card-title mb-0">{{ post.user.fullname }}</h6>
+                        <small class="text-muted">{{ post.timestamp.strftime('%d.%m.%Y в %H:%M') }}</small>
+                    </div>
+                </div>
+                <p class="card-text">{{ post.content }}</p>
+            </div>
+        </div>
+        {% else %}
+        <div class="alert alert-info">
+            Пока нет записей. Будьте первым, кто поделится новостью!
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

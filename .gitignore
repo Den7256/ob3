@@ -1,0 +1,4 @@
+/.venv/
+/social.db
+/.env
+/instance/social.db

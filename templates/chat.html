@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Чат с {{ recipient.fullname }}{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-8 mx-auto">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <div class="d-flex align-items-center">
+                    <div class="user-avatar me-2">
+                        <i class="bi bi-person-fill"></i>
+                    </div>
+                    <h5 class="mb-0">Чат с {{ recipient.fullname }}</h5>
+                </div>
+                <div>
+                    <a href="{{ url_for('user_profile', username=recipient.username) }}" class="btn btn-sm btn-outline-secondary me-1">
+                        <i class="bi bi-person"></i> Профиль
+                    </a>
+                    <a href="{{ url_for('inbox') }}" class="btn btn-sm btn-outline-primary">
+                        <i class="bi bi-arrow-left"></i> Назад
+                    </a>
+                </div>
+            </div>
+
+            <div class="card-body message-box">
+                {% for message in messages %}
+                <div class="mb-3 {% if message.sender_id == current_user.id %}text-end{% endif %}">
+                    <div class="d-flex {% if message.sender_id == current_user.id %}justify-content-end{% endif %}">
+                        <div class="{% if message.sender_id == current_user.id %}sent-message{% else %}received-message{% endif %}">
+                            <div class="d-flex justify-content-between mb-1">
+                                <small><strong>{{ message.sender.fullname }}</strong></small>
+                                <small>{{ message.timestamp.strftime('%H:%M') }}</small>
+                            </div>
+                            <p class="mb-0">{{ message.content }}</p>
+
+                            {% if not message.is_read and message.sender_id == current_user.id %}
+                            <small class="text-muted d-block text-end">
+                                <i class="bi bi-check"></i> Доставлено
+                            </small>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+                {% else %}
+                <div class="text-center text-muted py-4">
+                    <i class="bi bi-chat-left-text" style="font-size: 3rem;"></i>
+                    <p class="mt-2">Начните общение с {{ recipient.fullname }}</p>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div class="card-footer">
+                <form method="POST" action="{{ url_for('chat', user_id=recipient.id) }}">
+                    <div class="input-group mb-3">
+                        <textarea class="form-control" name="content" rows="2"
+                                 placeholder="Введите сообщение..." required></textarea>
+                        <button class="btn btn-primary" type="submit">
+                            <i class="bi bi-send"></i>
+                        </button>
+                    </div>
+                </form>
+
+                <form method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data">
+                    <div class="input-group">
+                        <input type="file" class="form-control" name="file">
+                        <button class="btn btn-outline-secondary" type="submit">
+                            <i class="bi bi-paperclip"></i> Прикрепить файл
+                        </button>
+                    </div>
+                    <small class="text-muted">Файлы хранятся не более {{ config['FILE_LIFETIME'] }} дней</small>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
