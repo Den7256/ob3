@@ -184,6 +184,7 @@ def handle_send_message(data):
         user_id = session['user_id']
         recipient_id = data['recipient_id']
         content = data['content'].strip()
+        temp_id = data.get('temp_id')  # Получаем временный ID
 
         if not content:
             print("⚪️ Пустое сообщение, пропускаем")
@@ -243,8 +244,9 @@ def handle_send_message(data):
         else:
             print(f"🔕 Пользователь {recipient_id} не в сети, уведомление не отправлено")
 
-        # Отправляем подтверждение отправителю
+        # Отправляем подтверждение отправителю с временным ID
         emit('message_delivered', {
+            'temp_id': temp_id,  # Передаем обратно временный ID
             'message_id': message.id,
             'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
         }, room=request.sid)
@@ -812,9 +814,20 @@ def mark_as_read(message_id):
 
         # Проверяем, что текущий пользователь - получатель
         if message.recipient_id == current_user_id:
+            # Обновляем статус сообщения
             message.is_read = True
             db.session.commit()
             print(f"✅ Сообщение {message_id} помечено как прочитанное пользователем {current_user_id}")
+
+            # Формируем комнату чата
+            room = get_chat_room_name(message.sender_id, message.recipient_id)
+
+            # Отправляем событие об обновлении статуса
+            socketio.emit('message_read', {
+                'message_id': message_id,
+                'is_read': True
+            }, room=room)
+
             return jsonify({'status': 'success'})
 
         print(f"🚫 Попытка пометить чужое сообщение: "

@@ -7,7 +7,7 @@
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
                 <div class="d-flex align-items-center">
-                    <div class="user-avatar me-2">
+                    <div class="user-avatar me-2" data-user-id="{{ recipient.id }}">
                         <i class="bi bi-person-fill"></i>
                     </div>
                     <h5 class="mb-0">Чат с {{ recipient.fullname }}</h5>
@@ -23,56 +23,7 @@
             </div>
 
             <div class="card-body" style="max-height: 60vh; overflow-y: auto;" id="message-box">
-                {% for message in messages %}
-                <div class="mb-3 {% if message.sender_id == current_user.id %}text-end{% endif %}">
-                    <div class="d-flex {% if message.sender_id == current_user.id %}justify-content-end{% endif %}">
-                        <div class="{% if message.sender_id == current_user.id %}sent-message{% else %}received-message{% endif %} p-3 rounded">
-                            <div class="d-flex justify-content-between align-items-center mb-1">
-                                <small><strong>
-                                    {% if message.sender_id == current_user.id %}Вы{% else %}{{ message.sender.fullname }}{% endif %}
-                                </strong></small>
-                                <small class="message-time">{{ message.timestamp.strftime('%d.%m.%Y %H:%M') }}</small>
-                            </div>
-
-                            {% if message.content %}
-                            <p class="mb-2">{{ message.content }}</p>
-                            {% endif %}
-
-                            {% for file in message.files %}
-                            <div class="mb-2">
-                                <div class="d-flex align-items-center">
-                                    <i class="bi bi-file-earmark me-2"></i>
-                                    <div>
-                                        <div class="fw-bold">{{ file.filename }}</div>
-                                        <small class="text-muted">
-                                            {{ (file.filesize|default(0))|filesizeformat }} -
-                                            <a href="{{ url_for('download_file', file_id=file.id) }}">Скачать</a>
-                                        </small>
-                                    </div>
-                                </div>
-                            </div>
-                            {% endfor %}
-
-                            {% if message.sender_id == current_user.id %}
-                            {% if message.is_read %}
-                            <small class="text-success d-block text-end">
-                                <i class="bi bi-check2-all"></i> Прочитано
-                            </small>
-                            {% else %}
-                            <small class="text-muted d-block text-end">
-                                <i class="bi bi-check"></i> Доставлено
-                            </small>
-                            {% endif %}
-                            {% endif %}
-                        </div>
-                    </div>
-                </div>
-                {% else %}
-                <div class="text-center text-muted py-4">
-                    <i class="bi bi-chat-left-text" style="font-size: 3rem;"></i>
-                    <p class="mt-2">Начните общение с {{ recipient.fullname }}</p>
-                </div>
-                {% endfor %}
+                <!-- Сообщения будут загружены через JavaScript -->
             </div>
 
             <div class="card-footer">
@@ -129,8 +80,8 @@
         const fileButton = document.getElementById('file-button');
         const connectionWarning = document.getElementById('connection-warning');
 
-        // Прокрутка вниз при загрузке
-        messageBox.scrollTop = messageBox.scrollHeight;
+        // Загружаем историю сообщений
+        loadChatHistory();
 
         // Обработчики событий
         messageForm.addEventListener('submit', handleMessageSubmit);
@@ -138,6 +89,35 @@
 
         // Инициализация WebSocket
         initWebSocket();
+
+        // Функция загрузки истории сообщений
+        function loadChatHistory() {
+            fetch(`/chat/history/${chatContext.recipientId}`)
+                .then(response => response.json())
+                .then(messages => {
+                    messageBox.innerHTML = ''; // Очищаем контейнер
+                    messages.forEach(msg => {
+                        addMessageToChat({
+                            id: msg.id,
+                            sender_id: msg.sender_id,
+                            recipient_id: msg.recipient_id,
+                            sender_name: msg.sender_name,
+                            content: msg.content,
+                            timestamp: msg.timestamp,
+                            is_read: msg.is_read,
+                            files: msg.files
+                        }, false); // Не временное сообщение
+                    });
+                    // Прокручиваем вниз
+                    messageBox.scrollTop = messageBox.scrollHeight;
+
+                    // Помечаем все входящие сообщения как прочитанные
+                    markAllMessagesAsRead();
+                })
+                .catch(error => {
+                    console.error('Ошибка загрузки истории:', error);
+                });
+        }
 
         // Функция инициализации WebSocket
         function initWebSocket() {
@@ -154,12 +134,14 @@
                         (data.sender_id === chatContext.recipientId &&
                          data.recipient_id === chatContext.currentUserId)) {
 
-                        // Форматируем время для сообщения
-                        const timestamp = new Date(data.timestamp);
-                        data.formattedTime = formatTime(timestamp);
+                        // Игнорируем собственные сообщения, которые уже были добавлены как временные
+                        if (data.sender_id === chatContext.currentUserId) {
+                            console.log("Это наше сообщение, пропускаем добавление");
+                            return;
+                        }
 
                         // Добавляем сообщение в чат
-                        addMessageToChat(data);
+                        addMessageToChat(data, false);
 
                         // Помечаем как прочитанное, если это входящее сообщение
                         if (data.sender_id === chatContext.recipientId) {
@@ -176,6 +158,35 @@
                     }
                 });
 
+                // Обработка подтверждения доставки
+                window.socket.on('message_delivered', function(data) {
+                    console.log('Подтверждение доставки:', data);
+                    const tempMsg = document.querySelector(`[data-temp-id="${data.temp_id}"]`);
+                    if (tempMsg) {
+                        // Заменяем временный ID на реальный
+                        tempMsg.id = `message-${data.message_id}`;
+                        tempMsg.removeAttribute('data-temp-id');
+                        const statusEl = tempMsg.querySelector('.delivery-status');
+                        if (statusEl) {
+                            statusEl.innerHTML = '<i class="bi bi-check"></i> Доставлено';
+                        }
+                    }
+                });
+
+                // Обработка обновления статуса прочтения
+                window.socket.on('message_read', function(data) {
+                    console.log('Статус прочтения обновлен:', data);
+                    const messageElement = document.getElementById(`message-${data.message_id}`);
+                    if (messageElement) {
+                        const statusEl = messageElement.querySelector('.delivery-status');
+                        if (statusEl) {
+                            statusEl.innerHTML = '<i class="bi bi-check2-all"></i> Прочитано';
+                            statusEl.classList.remove('text-muted');
+                            statusEl.classList.add('text-success');
+                        }
+                    }
+                });
+
                 // Обработка ошибок соединения
                 window.socket.on('connect_error', function(error) {
                     console.error("WebSocket connection error:", error);
@@ -185,6 +196,8 @@
                 window.socket.on('connect', function() {
                     console.log("WebSocket reconnected");
                     showConnectionWarning(false);
+                    // При переподключении присоединяемся к комнате чата
+                    joinChatRoom();
                 });
 
                 // Присоединяемся к комнате чата
@@ -201,6 +214,8 @@
                 window.socket.emit('join_chat', {
                     recipient_id: chatContext.recipientId
                 });
+            } else {
+                console.warn("Socket not connected, cannot join chat room");
             }
         }
 
@@ -211,60 +226,31 @@
 
             if (!content) return;
 
+            // Генерируем временный ID
+            const temp_id = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+
             // Создаем временное сообщение
-            const tempMessage = {
-                id: 'temp-' + Date.now(),
+            addMessageToChat({
+                id: temp_id,
                 sender_id: chatContext.currentUserId,
                 recipient_id: chatContext.recipientId,
                 sender_name: 'Вы',
                 content: content,
                 timestamp: new Date().toISOString(),
-                formattedTime: formatTime(new Date()),
-                is_read: false,
+                is_temp: true,
                 files: []
-            };
+            }, true, temp_id); // Передаем как временное
 
-            addMessageToChat(tempMessage);
-
-            // Отправляем на сервер
-            sendMessageToServer(content);
+            // Отправляем через WebSocket
+            window.socket.emit('send_message', {
+                recipient_id: chatContext.recipientId,
+                content: content,
+                temp_id: temp_id  // Передаем временный ID
+            });
 
             // Очищаем поле ввода
             messageInput.value = '';
             messageInput.focus();
-        }
-
-        // Функция отправки сообщения на сервер
-        function sendMessageToServer(content) {
-            fetch('/send_message', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({
-                    recipient_id: chatContext.recipientId,
-                    content: content
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'success') {
-                    // Обновляем временное сообщение
-                    const tempMsg = document.querySelector(`[id="message-${tempMessage.id}"]`);
-                    if (tempMsg) {
-                        tempMsg.id = `message-${data.message_id}`;
-                        const statusEl = tempMsg.querySelector('.delivery-status');
-                        if (statusEl) {
-                            statusEl.innerHTML = '<i class="bi bi-check"></i> Доставлено';
-                        }
-                    }
-                }
-            })
-            .catch(error => {
-                console.error('Error sending message:', error);
-                showError('Не удалось отправить сообщение');
-            });
         }
 
         // Функция обработки загрузки файла
@@ -289,24 +275,8 @@
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    // Добавляем сообщение о файле
-                    const fileMessage = {
-                        id: data.message_id,
-                        sender_id: chatContext.currentUserId,
-                        recipient_id: chatContext.recipientId,
-                        sender_name: 'Вы',
-                        content: `Отправлен файл: ${file.name}`,
-                        timestamp: new Date().toISOString(),
-                        formattedTime: formatTime(new Date()),
-                        is_read: false,
-                        files: [{
-                            id: data.file_id,
-                            filename: file.name,
-                            filesize: file.size
-                        }]
-                    };
-
-                    addMessageToChat(fileMessage);
+                    // После загрузки файла, перезагружаем историю, чтобы показать новое сообщение
+                    loadChatHistory();
                     playNotificationSound();
                 }
             })
@@ -321,7 +291,7 @@
         }
 
         // Функция добавления сообщения в чат
-        function addMessageToChat(data) {
+        function addMessageToChat(data, isTemporary = false, temp_id = null) {
             const isCurrentUser = (data.sender_id == chatContext.currentUserId);
             const messageBoxClass = isCurrentUser ? 'sent-message' : 'received-message';
             const senderName = isCurrentUser ? 'Вы' : chatContext.recipientName;
@@ -351,21 +321,33 @@
             // Статус доставки
             let statusHtml = '';
             if (isCurrentUser) {
-                statusHtml = data.is_read ?
-                    `<small class="text-success delivery-status"><i class="bi bi-check2-all"></i> Прочитано</small>` :
-                    `<small class="text-muted delivery-status"><i class="bi bi-check"></i> Доставлено</small>`;
+                if (isTemporary) {
+                    statusHtml = `<small class="text-muted delivery-status"><i class="bi bi-clock"></i> Отправка...</small>`;
+                } else {
+                    statusHtml = data.is_read ?
+                        `<small class="text-success delivery-status"><i class="bi bi-check2-all"></i> Прочитано</small>` :
+                        `<small class="text-muted delivery-status"><i class="bi bi-check"></i> Доставлено</small>`;
+                }
             }
+
+            // Форматируем время (добавляем 5 часов для Екатеринбурга)
+            const localTime = formatTime(data.timestamp);
 
             // Создаем элемент сообщения
             const messageDiv = document.createElement('div');
             messageDiv.className = `mb-3 ${isCurrentUser ? 'text-end' : ''}`;
             messageDiv.id = `message-${data.id}`;
+
+            if (isTemporary && temp_id) {
+                messageDiv.setAttribute('data-temp-id', temp_id);
+            }
+
             messageDiv.innerHTML = `
                 <div class="d-flex ${isCurrentUser ? 'justify-content-end' : 'justify-content-start'}">
                     <div class="${messageBoxClass} p-3 rounded">
                         <div class="d-flex justify-content-between align-items-center mb-1">
                             <small><strong>${senderName}</strong></small>
-                            <small>${data.formattedTime || formatTime(new Date(data.timestamp))}</small>
+                            <small>${localTime}</small>
                         </div>
                         ${contentHtml}
                         ${fileHtml}
@@ -381,7 +363,51 @@
         // Функция пометки сообщения как прочитанного
         function markMessageAsRead(messageId) {
             fetch(`/mark_as_read/${messageId}`, { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        console.log(`Сообщение ${messageId} помечено как прочитанное`);
+                        // Обновляем статус в UI
+                        updateMessageStatus(messageId, true);
+                    }
+                })
                 .catch(error => console.error('Error marking as read:', error));
+        }
+
+        // Функция обновления статуса сообщения в UI
+        function updateMessageStatus(messageId, isRead) {
+            const messageElement = document.getElementById(`message-${messageId}`);
+            if (messageElement) {
+                const statusEl = messageElement.querySelector('.delivery-status');
+                if (statusEl) {
+                    statusEl.innerHTML = isRead ?
+                        '<i class="bi bi-check2-all"></i> Прочитано' :
+                        '<i class="bi bi-check"></i> Доставлено';
+
+                    if (isRead) {
+                        statusEl.classList.remove('text-muted');
+                        statusEl.classList.add('text-success');
+                    } else {
+                        statusEl.classList.remove('text-success');
+                        statusEl.classList.add('text-muted');
+                    }
+                }
+            }
+        }
+
+        // Функция пометки всех входящих сообщений как прочитанных
+        function markAllMessagesAsRead() {
+            // Находим все непрочитанные сообщения от этого отправителя
+            const unreadMessages = document.querySelectorAll('.received-message .delivery-status');
+            unreadMessages.forEach(statusEl => {
+                const messageElement = statusEl.closest('.mb-3');
+                if (messageElement) {
+                    const messageId = messageElement.id.replace('message-', '');
+                    if (messageId) {
+                        markMessageAsRead(messageId);
+                    }
+                }
+            });
         }
 
         // Функция для форматирования размера файла
@@ -393,9 +419,18 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
         }
 
-        // Функция форматирования времени
-        function formatTime(date) {
-            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        // Функция форматирования времени (добавляем 5 часов к UTC)
+        function formatTime(utcString) {
+            const date = new Date(utcString);
+            // Добавляем 5 часов для Екатеринбурга (UTC+5)
+            date.setHours(date.getHours() + 5);
+            return date.toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric'
+            });
         }
 
         // Функция воспроизведения звука уведомления
@@ -444,6 +479,15 @@
         font-size: 0.75rem;
         margin-top: 5px;
         text-align: right;
+        transition: all 0.3s ease;
+    }
+
+    .delivery-status.text-muted {
+        color: #6c757d !important;
+    }
+
+    .delivery-status.text-success {
+        color: #198754 !important;
     }
 
     #file-progress {
