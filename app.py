@@ -178,7 +178,7 @@ def handle_send_message(data):
     try:
         if 'user_id' not in session:
             print("🚫 Попытка отправить сообщение без сессии")
-            emit('error', {'message': 'Требуется аутентификация'}, room=request.sid)
+            emit('error', {'message': 'Требуется аутентификации'}, room=request.sid)
             return
 
         user_id = session['user_id']
@@ -250,6 +250,23 @@ def handle_send_message(data):
             'message_id': message.id,
             'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
         }, room=request.sid)
+
+        # Отправляем событие обновления списка чатов
+        emit('inbox_update', {
+            'user_id': user_id,
+            'recipient_id': recipient_id,
+            'content': content,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }, room=f"user_{user_id}")
+
+        # Отправляем событие получателю, если он онлайн
+        if recipient_id in active_users:
+            emit('inbox_update', {
+                'user_id': recipient_id,
+                'sender_id': user_id,
+                'content': content,
+                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+            }, room=f"user_{recipient_id}")
 
         print(f"✅ Сообщение успешно отправлено и сохранено")
 
@@ -754,6 +771,23 @@ def upload_file(recipient_id):
     else:
         print(f"🔕 Пользователь {recipient_id} не в сети, уведомление не отправлено")
 
+    # Отправляем событие обновления списка чатов отправителю
+    socketio.emit('inbox_update', {
+        'user_id': session['user_id'],
+        'recipient_id': recipient_id,
+        'content': f"Отправлен файл: {filename}",
+        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+    }, room=f"user_{session['user_id']}")
+
+    # Отправляем событие получателю, если он онлайн
+    if recipient_id in active_users:
+        socketio.emit('inbox_update', {
+            'user_id': recipient_id,
+            'sender_id': session['user_id'],
+            'content': f"Отправлен файл: {filename}",
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }, room=f"user_{recipient_id}")
+
     return jsonify({
         'success': True,
         'message_id': message.id,
@@ -827,6 +861,13 @@ def mark_as_read(message_id):
                 'message_id': message_id,
                 'is_read': True
             }, room=room)
+
+            # Отправляем событие обновления списка чатов
+            socketio.emit('inbox_update', {
+                'user_id': current_user_id,
+                'sender_id': message.sender_id,
+                'is_read_update': True
+            }, room=f"user_{current_user_id}")
 
             return jsonify({'status': 'success'})
 
@@ -928,6 +969,23 @@ def send_message_http():
             print(f"🔔 Уведомление отправлено пользователю {recipient_id}")
         else:
             print(f"🔕 Пользователь {recipient_id} не в сети, уведомление не отправлено")
+
+        # Отправляем событие обновления списка чатов
+        socketio.emit('inbox_update', {
+            'user_id': session['user_id'],
+            'recipient_id': recipient_id,
+            'content': content,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }, room=f"user_{session['user_id']}")
+
+        # Отправляем событие получателю, если он онлайн
+        if recipient_id in active_users:
+            socketio.emit('inbox_update', {
+                'user_id': recipient_id,
+                'sender_id': session['user_id'],
+                'content': content,
+                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+            }, room=f"user_{recipient_id}")
 
         return jsonify({
             'status': 'success',
