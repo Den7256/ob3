@@ -62,7 +62,6 @@
 
 {% block scripts %}
 <script>
-    // Инициализация чата
     document.addEventListener('DOMContentLoaded', function() {
         console.log("Initializing chat...");
 
@@ -80,11 +79,22 @@
         const fileButton = document.getElementById('file-button');
         const connectionWarning = document.getElementById('connection-warning');
 
+        // Добавляем обработчик клавиш для textarea
+        messageInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
         // Загружаем историю сообщений
         loadChatHistory();
 
         // Обработчики событий
-        messageForm.addEventListener('submit', handleMessageSubmit);
+        messageForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+            sendMessage();
+        });
         fileButton.addEventListener('click', handleFileUpload);
 
         // Инициализация WebSocket
@@ -219,11 +229,9 @@
             }
         }
 
-        // Функция обработки отправки сообщения
-        function handleMessageSubmit(e) {
-            e.preventDefault();
+        // Функция отправки сообщения
+        function sendMessage() {
             const content = messageInput.value.trim();
-
             if (!content) return;
 
             // Генерируем временный ID
@@ -242,11 +250,15 @@
             }, true, temp_id); // Передаем как временное
 
             // Отправляем через WebSocket
-            window.socket.emit('send_message', {
-                recipient_id: chatContext.recipientId,
-                content: content,
-                temp_id: temp_id  // Передаем временный ID
-            });
+            if (window.socket) {
+                window.socket.emit('send_message', {
+                    recipient_id: chatContext.recipientId,
+                    content: content,
+                    temp_id: temp_id  // Передаем временный ID
+                });
+            } else {
+                console.warn("WebSocket not available, message not sent");
+            }
 
             // Очищаем поле ввода
             messageInput.value = '';

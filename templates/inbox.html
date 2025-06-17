@@ -7,6 +7,32 @@
         // Устанавливаем текущего пользователя
         window.currentUserId = {{ current_user.id }};
 
+        // Функция для форматирования времени с коррекцией часового пояса
+        function formatInboxTime(utcString) {
+            const date = new Date(utcString);
+            // Коррекция для Екатеринбурга (UTC+5)
+            date.setHours(date.getHours() + 5);
+
+            return date.toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric'
+            });
+        }
+
+        // Обновляем все временные метки на странице
+        function updateAllTimes() {
+            document.querySelectorAll('.message-time[data-utc]').forEach(el => {
+                const utcTime = el.getAttribute('data-utc');
+                if (utcTime) {
+                    el.textContent = formatInboxTime(utcTime);
+                    el.removeAttribute('data-utc');
+                }
+            });
+        }
+
         // Подписываемся на событие обновления списка чатов
         if (window.socket) {
             window.socket.on('inbox_update', function(data) {
@@ -64,17 +90,10 @@
                     `;
                 }
 
-                // Обновляем время
+                // Обновляем время с коррекцией часового пояса
                 const timeElement = conversation.querySelector('.message-time');
                 if (timeElement) {
-                    const date = new Date(data.timestamp);
-                    date.setHours(date.getHours() + 5); // Коррекция для Екатеринбурга
-                    timeElement.textContent = date.toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        day: '2-digit',
-                        month: '2-digit'
-                    });
+                    timeElement.textContent = formatInboxTime(data.timestamp);
                 }
 
                 // Обновляем непрочитанные сообщения
@@ -113,6 +132,8 @@
                         container.parentNode.replaceChild(newList, container);
                         // Повторно инициализируем обработчики событий
                         initConversationHover();
+                        // Обновляем временные метки
+                        updateAllTimes();
                     }
                 });
         }
@@ -141,6 +162,7 @@
         }
 
         // Первоначальная инициализация
+        updateAllTimes();  // Обновляем все временные метки
         initConversationHover();
     });
 </script>
@@ -177,7 +199,10 @@
                             <div class="flex-grow-1">
                                 <div class="d-flex justify-content-between">
                                     <h6 class="mb-1">{{ user.fullname }}</h6>
-                                    <small class="message-time">{{ message.timestamp.strftime('%d.%m.%Y %H:%M') }}</small>
+                                    <!-- Добавлен атрибут data-utc для коррекции времени -->
+                                    <small class="message-time" data-utc="{{ message.timestamp.isoformat() }}">
+                                        {{ message.timestamp.strftime('%d.%m.%Y %H:%M') }}
+                                    </small>
                                 </div>
                                 <p class="mb-0 conversation-content">
                                     <small>
