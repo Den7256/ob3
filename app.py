@@ -1,3 +1,4 @@
+# app.py
 # -*- coding: utf-8 -*-
 import os
 import datetime
@@ -16,7 +17,6 @@ from flask import abort
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask import copy_current_request_context
 
-
 # Игнорируем предупреждения об устаревших методах
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -26,6 +26,8 @@ load_dotenv()
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.getenv('SECRET_KEY', 'supersecretkey'),
+    SESSION_COOKIE_SECURE=False,  # Для локальной разработки
+    SESSION_COOKIE_SAMESITE='Lax',
     SQLALCHEMY_DATABASE_URI=os.getenv('DATABASE_URI', 'sqlite:///social.db'),
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
     UPLOAD_FOLDER=os.getenv('UPLOAD_FOLDER', 'uploads'),
@@ -38,11 +40,24 @@ app.config.update(
     LDAP_USER_OU=os.getenv('LDAP_USER_OU'),
     LDAP_ADMIN_GROUP=os.getenv('LDAP_ADMIN_GROUP'),
     LDAP_SERVICE_ACCOUNT=os.getenv('LDAP_SERVICE_ACCOUNT'),
-    LDAP_SERVICE_PASSWORD=os.getenv('LDAP_SERVICE_PASSWORD')
+    LDAP_SERVICE_PASSWORD=os.getenv('LDAP_SERVICE_PASSWORD'),
 )
 
 db = SQLAlchemy(app)
 auth = HTTPBasicAuth()
+
+# Инициализация SocketIO с улучшенными параметрами стабильности
+socketio = SocketIO(
+    app,
+    async_mode='eventlet',
+    cors_allowed_origins="*",
+    logger=True,
+    engineio_logger=True,
+    ping_timeout=300,
+    ping_interval=60,
+    max_http_buffer_size=100 * 1024 * 1024,  # 100MB для файлов
+    manage_session=False  # Важно для работы с сессиями
+)
 
 # Создаем папку для загрузок
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -57,7 +72,7 @@ class User(db.Model):
     department = db.Column(db.String(120))
     position = db.Column(db.String(120))
     is_active = db.Column(db.Boolean, default=True)
-    last_seen = db.Column(db.DateTime, default=datetime.datetime.now)
+    last_seen = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     password_hash = db.Column(db.String(128), default='')
 
     def unread_messages_count(self):
@@ -70,19 +85,19 @@ class User(db.Model):
 class Post(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.Text, nullable=False)
-    timestamp = db.Column(db.DateTime, index=True, default=datetime.datetime.now)
+    timestamp = db.Column(db.DateTime, index=True, default=datetime.datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     user = db.relationship('User', backref=db.backref('posts', lazy=True))
 
 
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    content = db.Column(db.Text, nullable=True)  # Может быть пустым, если только файл
-    timestamp = db.Column(db.DateTime, index=True, default=datetime.datetime.now)
+    content = db.Column(db.Text, nullable=True)
+    timestamp = db.Column(db.DateTime, index=True, default=datetime.datetime.utcnow)
     sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     recipient_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     is_read = db.Column(db.Boolean, default=False)
-    files = db.relationship('File', backref='message', lazy=True)  # Связь с файлами
+    files = db.relationship('File', backref='message', lazy=True)
     sender = db.relationship('User', foreign_keys=[sender_id], backref=db.backref('sent_messages', lazy=True))
     recipient = db.relationship('User', foreign_keys=[recipient_id], backref=db.backref('received_messages', lazy=True))
 
@@ -90,73 +105,220 @@ class Message(db.Model):
 class File(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     filename = db.Column(db.String(255), nullable=False)
-    upload_date = db.Column(db.DateTime, default=datetime.datetime.now)
+    upload_date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    message_id = db.Column(db.Integer, db.ForeignKey('message.id'), nullable=True)  # Связь с сообщением
+    message_id = db.Column(db.Integer, db.ForeignKey('message.id'), nullable=True)
+    filesize = db.Column(db.BigInteger, default=0)  # Добавлено поле для хранения размера файла
     user = db.relationship('User', backref=db.backref('files', lazy=True))
 
     @property
     def filepath(self):
         return os.path.join(app.config['UPLOAD_FOLDER'], self.filename)
 
-    @property
-    def filesize(self):
-        if os.path.exists(self.filepath):
-            return os.path.getsize(self.filepath)
-        return 0
+
+# Глобальный словарь для отслеживания активных пользователей
+active_users = {}  # user_id: sid
 
 
-# Гарантированное создание/обновление схемы БД
+# Функция для получения имени комнаты чата
+def get_chat_room_name(user1_id, user2_id):
+    sorted_ids = sorted([user1_id, user2_id])
+    return f"chat_{sorted_ids[0]}_{sorted_ids[1]}"
+
+
+# Обработчики WebSocket
+@socketio.on('connect')
+def handle_connect(auth=None):  # Исправление: добавлен параметр auth
+    print(f"⚡️ Новое подключение: {request.sid}")
+    if 'user_id' in session:
+        user_id = session['user_id']
+        active_users[user_id] = request.sid
+        join_room(f"user_{user_id}")  # Присоединяем к личной комнате для уведомлений
+        print(f"👤 Пользователь {user_id} подключен. SID: {request.sid}")
+        emit('connection_success', {'message': 'Успешное подключение к WebSocket'})
+
+        # Отправляем обновленный список активных пользователей
+        update_online_users()
+    else:
+        print("⚠️ Подключение без аутентификации")
+        emit('reconnect_required', {'reason': 'Требуется аутентификация'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"❌ Отключение: {request.sid}")
+    if 'user_id' in session:
+        user_id = session['user_id']
+        if user_id in active_users:
+            del active_users[user_id]
+        print(f"👤 Пользователь {user_id} отключен")
+
+        # Отправляем обновленный список активных пользователей
+        update_online_users()
+
+
+@socketio.on('join_chat')
+def handle_join_chat(data):
+    if 'user_id' not in session:
+        print("🚫 Попытка присоединиться к чату без сессии")
+        emit('error', {'message': 'Требуется аутентификация'})
+        return
+
+    user_id = session['user_id']
+    recipient_id = data['recipient_id']
+    room = get_chat_room_name(user_id, recipient_id)
+    join_room(room)
+    print(f"👥 Пользователь {user_id} присоединился к комнате чата: {room}")
+    emit('room_joined', {'room': room})
+
+
+@socketio.on('send_message')
+def handle_send_message(data):
+    print(f"✉️ Получено сообщение: {data}")
+    try:
+        if 'user_id' not in session:
+            print("🚫 Попытка отправить сообщение без сессии")
+            emit('error', {'message': 'Требуется аутентификация'}, room=request.sid)
+            return
+
+        user_id = session['user_id']
+        recipient_id = data['recipient_id']
+        content = data['content'].strip()
+
+        if not content:
+            print("⚪️ Пустое сообщение, пропускаем")
+            return
+
+        print(f"✉️ Сообщение от {user_id} для {recipient_id}: {content[:50]}...")
+
+        # Создаем сообщение в БД
+        message = Message(
+            content=content,
+            sender_id=user_id,
+            recipient_id=recipient_id,
+            is_read=False
+        )
+        db.session.add(message)
+        db.session.commit()  # Фиксируем сразу, чтобы получить ID
+        print(f"📝 Сообщение создано в БД, ID: {message.id}")
+
+        # Формируем комнату
+        room = get_chat_room_name(user_id, recipient_id)
+
+        # Получаем данные отправителя
+        sender = User.query.get(user_id)
+
+        # Формируем данные для отправки
+        message_data = {
+            'id': message.id,
+            'sender_id': user_id,
+            'recipient_id': recipient_id,
+            'sender_name': sender.fullname,
+            'content': content,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',  # Добавляем 'Z' для UTC
+            'room': room,
+            'is_read': False,
+            'files': []
+        }
+
+        # Отправляем сообщение в комнату чата
+        emit('new_message', message_data, room=room)
+        print(f"📤 Сообщение отправлено в комнату: {room}")
+
+        # Отправляем уведомление в личную комнату получателя
+        notification_data = {
+            'sender_id': user_id,
+            'sender_name': sender.fullname,
+            'content': content,
+            'room': room,
+            'message_id': message.id,
+            'recipient_id': recipient_id,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }
+
+        # Проверяем, что получатель онлайн
+        if recipient_id in active_users:
+            emit('new_message_notification', notification_data, room=f"user_{recipient_id}")
+            print(f"🔔 Уведомление отправлено пользователю {recipient_id}")
+        else:
+            print(f"🔕 Пользователь {recipient_id} не в сети, уведомление не отправлено")
+
+        # Отправляем подтверждение отправителю
+        emit('message_delivered', {
+            'message_id': message.id,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }, room=request.sid)
+
+        print(f"✅ Сообщение успешно отправлено и сохранено")
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Ошибка при отправке сообщения: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        emit('error', {'message': 'Не удалось отправить сообщение'}, room=request.sid)
+
+
 def init_database():
     with app.app_context():
-        # Создаем все таблицы, если их нет
         db.create_all()
-
-        # Проверяем существующие столбцы
         inspector = db.inspect(db.engine)
 
-        # Для таблицы message
-        if 'message' in inspector.get_table_names():
-            columns = [col['name'] for col in inspector.get_columns('message')]
-            if 'is_read' not in columns:
-                try:
-                    with db.engine.begin() as connection:
-                        connection.execute("ALTER TABLE message ADD COLUMN is_read BOOLEAN DEFAULT 0")
-                    app.logger.info("Added column: is_read to message")
-                except Exception as e:
-                    app.logger.error(f"Error adding column is_read: {str(e)}")
+        # Проверяем и добавляем отсутствующие столбцы
+        tables = {
+            'message': ['is_read'],
+            'file': ['message_id', 'filesize']
+        }
 
-        # Для таблицы file
-        if 'file' in inspector.get_table_names():
-            columns = [col['name'] for col in inspector.get_columns('file')]
-            if 'message_id' not in columns:
-                try:
-                    with db.engine.begin() as connection:
-                        connection.execute("ALTER TABLE file ADD COLUMN message_id INTEGER")
-                    app.logger.info("Added column: message_id to file")
-                except Exception as e:
-                    app.logger.error(f"Error adding column message_id: {str(e)}")
+        for table_name, columns in tables.items():
+            if table_name in inspector.get_table_names():
+                existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+                for column in columns:
+                    if column not in existing_columns:
+                        try:
+                            with db.engine.begin() as connection:
+                                if column == 'is_read':
+                                    connection.execute(
+                                        f"ALTER TABLE {table_name} ADD COLUMN {column} BOOLEAN DEFAULT 0")
+                                elif column == 'filesize':
+                                    connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} BIGINT DEFAULT 0")
+                                else:
+                                    connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} INTEGER")
+                            print(f"✅ Добавлен столбец {column} в таблицу {table_name}")
+                        except Exception as e:
+                            print(f"❌ Ошибка добавления столбца {column}: {str(e)}")
 
-        app.logger.info("Database schema initialized")
+        print("🛢️ Инициализация схемы базы данных завершена")
 
 
-# Контекстный процессор для добавления общих данных во все шаблоны
+def update_online_users():
+    """Отправляет обновленный список онлайн-пользователей всем клиентам"""
+    online_user_ids = list(active_users.keys())
+    online_users = User.query.filter(User.id.in_(online_user_ids)).all()
+
+    # Формируем список пользователей с базовой информацией
+    users_data = [{
+        'id': user.id,
+        'username': user.username,
+        'fullname': user.fullname
+    } for user in online_users]
+
+    # ИСПРАВЛЕНИЕ: используем правильный метод для широковещательной рассылки
+    socketio.emit('online_users_update', {'users': users_data}, namespace='/')
+    print(f"🔄 Отправлен обновленный список онлайн-пользователей: {len(online_users)} пользователей")
+
+
 @app.context_processor
 def inject_common_data():
     common = {
-        'now': datetime.datetime.now(),
-        'current_year': datetime.datetime.now().year
+        'now': datetime.datetime.utcnow(),
+        'current_year': datetime.datetime.utcnow().year
     }
 
     if 'user_id' in session:
         user = User.query.get(session['user_id'])
         common['current_user'] = user
-
-        # Подсчет непрочитанных сообщений для навбара
-        common['unread_messages_count'] = Message.query.filter_by(
-            recipient_id=session['user_id'],
-            is_read=False
-        ).count()
+        common['unread_messages_count'] = user.unread_messages_count() if user else 0
 
     return common
 
@@ -173,11 +335,10 @@ def get_ldap_connection(username=None, password=None, service_auth=False):
         username = app.config['LDAP_SERVICE_ACCOUNT']
         password = app.config['LDAP_SERVICE_PASSWORD']
 
-        # Форматы для подключения
         formats = [
-            f"{username}@{app.config['LDAP_DOMAIN']}",  # UPN формат
-            f"{app.config['LDAP_DOMAIN']}\\{username}",  # DOMAIN\\username
-            f"CN={username},{app.config['LDAP_USER_OU']}"  # Distinguished Name
+            f"{username}@{app.config['LDAP_DOMAIN']}",
+            f"{app.config['LDAP_DOMAIN']}\\{username}",
+            f"CN={username},{app.config['LDAP_USER_OU']}"
         ]
 
         for user_dn in formats:
@@ -194,7 +355,6 @@ def get_ldap_connection(username=None, password=None, service_auth=False):
             except Exception:
                 continue
 
-        # Если NTLM не сработал, пробуем SIMPLE
         for user_dn in formats:
             try:
                 conn = Connection(
@@ -207,11 +367,10 @@ def get_ldap_connection(username=None, password=None, service_auth=False):
                 if conn.bound:
                     return conn
             except Exception as e:
-                app.logger.warning(f"SIMPLE auth failed: {str(e)}")
+                print(f"⚠️ Ошибка SIMPLE аутентификации: {str(e)}")
 
-        raise Exception("All authentication attempts failed")
+        raise Exception("❌ Все попытки аутентификации не удались")
     else:
-        # Для обычных пользователей
         user_dn = f"{username}@{app.config['LDAP_DOMAIN']}"
         try:
             return Connection(
@@ -231,7 +390,7 @@ def get_ldap_connection(username=None, password=None, service_auth=False):
                     auto_bind=True
                 )
             except Exception as e:
-                app.logger.error(f"User auth failed: {str(e)}")
+                print(f"⚠️ Ошибка аутентификации пользователя: {str(e)}")
                 return None
 
 
@@ -248,7 +407,7 @@ def get_user_ldap_attributes(username, attributes):
             return conn.entries[0]
         return None
     except Exception as e:
-        app.logger.error(f"LDAP search failed: {str(e)}")
+        print(f"⚠️ Ошибка поиска в LDAP: {str(e)}")
         return None
 
 
@@ -269,55 +428,51 @@ def is_user_in_group(username, group_dn):
         )
         return bool(conn.entries)
     except Exception as e:
-        app.logger.error(f"LDAP group check failed: {str(e)}")
+        print(f"⚠️ Ошибка проверки группы LDAP: {str(e)}")
         return False
 
 
 @auth.verify_password
 def verify_password(username, password):
     try:
-        # Пытаемся подключиться к AD
         conn = get_ldap_connection(username, password)
         if not conn or not conn.bound:
+            print(f"⚠️ Не удалось подключиться к LDAP для пользователя {username}")
             return None
 
-        # Получаем информацию о пользователе
         ldap_user = get_user_ldap_attributes(username,
                                              ['displayName', 'mail', 'department', 'title'])
 
         if not ldap_user:
+            print(f"⚠️ Пользователь {username} не найден в LDAP")
             return None
 
-        # Ищем или создаем пользователя в локальной БД
         user = User.query.filter_by(username=username).first()
         if not user:
             user = User(username=username)
             db.session.add(user)
 
-        # Обновляем атрибуты
         user.fullname = getattr(ldap_user, 'displayName', username)
         user.email = getattr(ldap_user, 'mail', '')
         user.department = getattr(ldap_user, 'department', '')
         user.position = getattr(ldap_user, 'title', '')
         user.is_active = True
-        user.last_seen = datetime.datetime.now()
+        user.last_seen = datetime.datetime.utcnow()
 
         db.session.commit()
 
-        # Сохраняем в сессии
         session['user_id'] = user.id
         session['is_admin'] = is_user_in_group(username, app.config['LDAP_ADMIN_GROUP'])
 
+        print(f"✅ Успешная аутентификация: {username}")
         return username
     except Exception as e:
-        app.logger.error(f"Authentication failed: {str(e)}")
+        print(f"❌ Ошибка аутентификации: {str(e)}")
         return None
 
 
-# CLI Commands
 @app.cli.command('sync-ad')
 def sync_ad_users():
-    """Синхронизация пользователей с Active Directory"""
     try:
         with app.app_context():
             conn = get_ldap_connection(service_auth=True)
@@ -343,42 +498,41 @@ def sync_ad_users():
                 user.position = entry.title.value if 'title' in entry and entry.title.value else ''
                 user.is_active = True
 
-            # Деактивируем отсутствующих в AD пользователей
             inactive_users = User.query.filter(User.username.notin_(active_users)).all()
             for user in inactive_users:
                 user.is_active = False
 
             db.session.commit()
-            print(f"Синхронизировано {len(active_users)} пользователей")
+            print(f"✅ Синхронизировано {len(active_users)} пользователей")
     except Exception as e:
-        print(f"Ошибка синхронизации: {str(e)}")
+        print(f"❌ Ошибка синхронизации: {str(e)}")
         db.session.rollback()
 
 
-# Utility Functions
 def cleanup_old_files():
     with app.app_context():
-        # Используем datetime.now() вместо устаревшего utcnow()
-        expiration = datetime.datetime.now() - datetime.timedelta(days=app.config['FILE_LIFETIME'])
+        expiration = datetime.datetime.utcnow() - datetime.timedelta(days=app.config['FILE_LIFETIME'])
         old_files = File.query.filter(File.upload_date < expiration).all()
 
+        deleted_count = 0
         for file in old_files:
             try:
                 file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
                 if os.path.exists(file_path):
                     os.remove(file_path)
+                    print(f"🗑️ Удален файл: {file.filename}")
+                db.session.delete(file)
+                deleted_count += 1
             except OSError as e:
-                app.logger.error(f"Error deleting file {file.filename}: {str(e)}")
-            db.session.delete(file)
+                print(f"⚠️ Ошибка удаления файла {file.filename}: {str(e)}")
 
         db.session.commit()
-        app.logger.info(f"Cleaned up {len(old_files)} old files")
+        print(f"🧹 Очищено {deleted_count} старых файлов")
 
 
 @app.template_filter('filesizeformat')
 def filesizeformat_filter(value):
-    """Форматирует размер файла в читаемый вид"""
-    if value is None:
+    if value is None or value == 0:
         return "0 B"
 
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -388,8 +542,6 @@ def filesizeformat_filter(value):
     return f"{value:.1f} TB"
 
 
-
-# Routes
 @app.route('/')
 @auth.login_required
 def index():
@@ -427,46 +579,19 @@ def user_profile(username):
 def chat(user_id):
     recipient = User.query.get_or_404(user_id)
 
-    if request.method == 'POST':
-        content = request.form.get('content', '')
-
-        # Создаем сообщение
-        message = Message(
-            content=content,
-            sender_id=session['user_id'],
-            recipient_id=user_id,
-            is_read=False
-        )
-        db.session.add(message)
-        db.session.flush()  # Получаем ID сообщения перед коммитом
-
-        # Обработка файлов
-        if 'file' in request.files:
-            file = request.files['file']
-            if file.filename != '':
-                filename = file.filename  # Оригинальное имя с кириллицей
-                safe_filename = secure_filename(filename)  # Безопасное имя для хранения и путей
-                filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
-                file.save(filepath)
-
-                new_file = File(
-                    filename=filename,  # сохраняем оригинальное имя
-                    user_id=session['user_id'],
-                    message_id=message.id
-                )
-                db.session.add(new_file)
-
-        db.session.commit()
-
-    # Помечаем сообщения как прочитанные
-    Message.query.filter_by(
+    # Помечаем входящие сообщения как прочитанные
+    unread_messages = Message.query.filter_by(
         sender_id=user_id,
         recipient_id=session['user_id'],
         is_read=False
-    ).update({'is_read': True})
+    ).all()
+
+    for msg in unread_messages:
+        msg.is_read = True
+
     db.session.commit()
 
-    # Получаем все сообщения
+    # Получаем все сообщения для этого чата
     messages = Message.query.filter(
         ((Message.sender_id == session['user_id']) & (Message.recipient_id == user_id)) |
         ((Message.sender_id == user_id) & (Message.recipient_id == session['user_id']))
@@ -475,10 +600,43 @@ def chat(user_id):
     return render_template('chat.html', recipient=recipient, messages=messages)
 
 
+@app.route('/chat/history/<int:recipient_id>', methods=['GET'])
+@auth.login_required
+def chat_history(recipient_id):
+    print(f"📜 Загрузка истории чата для пользователя {session['user_id']} с {recipient_id}")
+
+    # Получаем все сообщения для этого чата
+    messages = Message.query.filter(
+        ((Message.sender_id == session['user_id']) & (Message.recipient_id == recipient_id)) |
+        ((Message.sender_id == recipient_id) & (Message.recipient_id == session['user_id']))
+    ).order_by(Message.timestamp.desc()).limit(100).all()
+
+    # Форматируем сообщения для JSON
+    result = []
+    for msg in messages:
+        message_data = {
+            'id': msg.id,
+            'content': msg.content,
+            'timestamp': msg.timestamp.isoformat() + 'Z',  # Добавляем 'Z' для UTC
+            'sender_id': msg.sender_id,
+            'sender_name': msg.sender.fullname,
+            'is_read': msg.is_read,
+            'files': [{
+                'id': f.id,
+                'filename': f.filename,
+                'filesize': f.filesize
+            } for f in msg.files]
+        }
+        result.append(message_data)
+
+    print(f"📚 Найдено {len(result)} сообщений")
+    return jsonify(result[::-1])  # Переворачиваем, чтобы старые сообщения были первыми
+
+
 @app.route('/inbox')
 @auth.login_required
 def inbox():
-    # Получаем всех собеседников
+    # Получаем ID всех собеседников
     sent_to = db.session.query(
         Message.recipient_id
     ).filter(
@@ -493,7 +651,6 @@ def inbox():
 
     all_user_ids = {id for (id,) in sent_to} | {id for (id,) in received_from}
 
-    # Для каждого собеседника получаем последнее сообщение
     conversations = []
     unread_counts = {}
 
@@ -508,7 +665,7 @@ def inbox():
             user = User.query.get(user_id)
             conversations.append((last_message, user))
 
-            # Считаем непрочитанные
+            # Считаем непрочитанные сообщения от этого пользователя
             count = Message.query.filter_by(
                 sender_id=user_id,
                 recipient_id=session['user_id'],
@@ -527,15 +684,20 @@ def inbox():
 def upload_file(recipient_id):
     """Отдельный роут для загрузки файлов в чате"""
     if 'file' not in request.files:
-        return redirect(url_for('chat', user_id=recipient_id))
+        return jsonify({'error': 'No file part'}), 400
 
     file = request.files['file']
     if file.filename == '':
-        return redirect(url_for('chat', user_id=recipient_id))
+        return jsonify({'error': 'No selected file'}), 400
 
-    # Создаем сообщение только для файла
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    filesize = os.path.getsize(filepath)
+
+    # Создаем сообщение для файла
     message = Message(
-        content="",
+        content=f"Отправлен файл: {filename}",
         sender_id=session['user_id'],
         recipient_id=recipient_id,
         is_read=False
@@ -543,19 +705,58 @@ def upload_file(recipient_id):
     db.session.add(message)
     db.session.flush()  # Получаем ID сообщения
 
-    filename = file.filename
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-
     new_file = File(
         filename=filename,
         user_id=session['user_id'],
-        message_id=message.id  # Связываем файл с сообщением
+        message_id=message.id,
+        filesize=filesize
     )
     db.session.add(new_file)
     db.session.commit()
 
-    return redirect(url_for('chat', user_id=recipient_id))
+    # Отправляем уведомление о новом файле
+    room = get_chat_room_name(session['user_id'], recipient_id)
+    sender = User.query.get(session['user_id'])
+
+    # Формируем данные для уведомления
+    file_data = {
+        'id': message.id,
+        'sender_id': session['user_id'],
+        'recipient_id': recipient_id,
+        'sender_name': sender.fullname,
+        'content': f"Отправлен файл: {filename}",
+        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',  # Добавляем 'Z' для UTC
+        'room': room,
+        'is_read': False,
+        'files': [{
+            'id': new_file.id,
+            'filename': filename,
+            'filesize': filesize
+        }]
+    }
+
+    # Отправляем сообщение в комнату чата
+    socketio.emit('new_message', file_data, room=room)
+
+    # Отправляем уведомление только получателю, если он онлайн
+    if recipient_id in active_users:
+        socketio.emit('new_message_notification', {
+            'sender_id': session['user_id'],
+            'sender_name': sender.fullname,
+            'content': f"Отправлен файл: {filename}",
+            'room': room,
+            'recipient_id': recipient_id,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }, room=f"user_{recipient_id}")
+        print(f"🔔 Уведомление о файле отправлено пользователю {recipient_id}")
+    else:
+        print(f"🔕 Пользователь {recipient_id} не в сети, уведомление не отправлено")
+
+    return jsonify({
+        'success': True,
+        'message_id': message.id,
+        'file_id': new_file.id
+    })
 
 
 @app.route('/download/<int:file_id>')
@@ -581,25 +782,55 @@ def download_file(file_id):
             allowed = True  # Администратор
 
         if not allowed:
-            app.logger.warning(f"Access denied to file {file_id} for user {session['user_id']}")
+            print(f"🚫 Доступ запрещен к файлу {file_id} для пользователя {session['user_id']}")
             return "Forbidden", 403
 
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
 
         if not os.path.exists(file_path):
-            app.logger.error(f"File not found: {file_path}")
+            print(f"⚠️ Файл не найден: {file_path}")
             return "File not found", 404
 
-        app.logger.info(f"Serving file: {file.filename} to user {session['user_id']}")
+        print(f"📥 Отправка файла: {file.filename} пользователю {session['user_id']}")
         return send_from_directory(
             app.config['UPLOAD_FOLDER'],
             file.filename,
             as_attachment=True,
-            download_name=file.filename  # Указываем имя для скачивания
+            download_name=file.filename
         )
     except Exception as e:
-        app.logger.error(f"Error downloading file {file_id}: {str(e)}")
+        print(f"❌ Ошибка при скачивании файла {file_id}: {str(e)}")
         return "Internal server error", 500
+
+
+@app.route('/mark_as_read/<int:message_id>', methods=['POST'])
+@auth.login_required
+def mark_as_read(message_id):
+    try:
+        message = Message.query.get_or_404(message_id)
+        current_user_id = session['user_id']
+
+        # Проверяем, что текущий пользователь - получатель
+        if message.recipient_id == current_user_id:
+            message.is_read = True
+            db.session.commit()
+            print(f"✅ Сообщение {message_id} помечено как прочитанное пользователем {current_user_id}")
+            return jsonify({'status': 'success'})
+
+        print(f"🚫 Попытка пометить чужое сообщение: "
+              f"message_id={message_id}, recipient={message.recipient_id}, "
+              f"current_user={current_user_id}")
+
+        return jsonify({
+            'status': 'error',
+            'message': 'Forbidden: Вы не получатель этого сообщения'
+        }), 403
+    except Exception as e:
+        print(f"❌ Ошибка при пометке сообщения {message_id}: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': 'Internal server error'
+        }), 500
 
 
 @app.route('/admin')
@@ -619,6 +850,83 @@ def admin_panel():
     return render_template('admin.html', users=users, stats=stats)
 
 
+@app.route('/unread_count')
+@auth.login_required
+def unread_count():
+    count = Message.query.filter_by(
+        recipient_id=session['user_id'],
+        is_read=False
+    ).count()
+    return jsonify({'count': count})
+
+
+@app.route('/send_message', methods=['POST'])
+@auth.login_required
+def send_message_http():
+    """Эндпоинт для отправки сообщений через HTTP"""
+    try:
+        data = request.json
+        recipient_id = data['recipient_id']
+        content = data['content'].strip()
+
+        if not content:
+            return jsonify({'status': 'error', 'message': 'Empty message'}), 400
+
+        # Создаем сообщение в БД
+        message = Message(
+            content=content,
+            sender_id=session['user_id'],
+            recipient_id=recipient_id,
+            is_read=False
+        )
+        db.session.add(message)
+        db.session.commit()
+
+        # Формируем комнату
+        room = get_chat_room_name(session['user_id'], recipient_id)
+        sender = User.query.get(session['user_id'])
+
+        # Формируем данные для отправки
+        message_data = {
+            'id': message.id,
+            'sender_id': session['user_id'],
+            'recipient_id': recipient_id,
+            'sender_name': sender.fullname,
+            'content': content,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',  # Добавляем 'Z' для UTC
+            'room': room,
+            'is_read': False,
+            'files': []
+        }
+
+        # Отправляем через WebSocket
+        socketio.emit('new_message', message_data, room=room)
+
+        # Отправляем уведомление только получателю, если он онлайн
+        if recipient_id in active_users:
+            socketio.emit('new_message_notification', {
+                'sender_id': session['user_id'],
+                'sender_name': sender.fullname,
+                'content': content,
+                'room': room,
+                'recipient_id': recipient_id,
+                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+            }, room=f"user_{recipient_id}")
+            print(f"🔔 Уведомление отправлено пользователю {recipient_id}")
+        else:
+            print(f"🔕 Пользователь {recipient_id} не в сети, уведомление не отправлено")
+
+        return jsonify({
+            'status': 'success',
+            'message_id': message.id
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error sending message: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 # Инициализация приложения
 def init_app():
     # Инициализация базы данных
@@ -626,12 +934,18 @@ def init_app():
 
     # Очистка старых файлов в контексте приложения
     with app.app_context():
-        db.create_all()
-        init_database()
         cleanup_old_files()
+    print("🚀 Приложение инициализировано")
 
 
 # Запуск приложения
 if __name__ == '__main__':
     init_app()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=5000,
+        debug=True,
+        use_reloader=False,  # Важно для стабильности WebSocket
+        allow_unsafe_werkzeug=True
+    )

@@ -22,14 +22,16 @@
                 </div>
             </div>
 
-            <div class="card-body message-box">
+            <div class="card-body" style="max-height: 60vh; overflow-y: auto;" id="message-box">
                 {% for message in messages %}
                 <div class="mb-3 {% if message.sender_id == current_user.id %}text-end{% endif %}">
                     <div class="d-flex {% if message.sender_id == current_user.id %}justify-content-end{% endif %}">
-                        <div class="{% if message.sender_id == current_user.id %}sent-message{% else %}received-message{% endif %}">
-                            <div class="d-flex justify-content-between mb-1">
-                                <small><strong>{{ message.sender.fullname }}</strong></small>
-                                <small>{{ message.timestamp.strftime('%d.%m.%Y %H:%M') }}</small>
+                        <div class="{% if message.sender_id == current_user.id %}sent-message{% else %}received-message{% endif %} p-3 rounded">
+                            <div class="d-flex justify-content-between align-items-center mb-1">
+                                <small><strong>
+                                    {% if message.sender_id == current_user.id %}Вы{% else %}{{ message.sender.fullname }}{% endif %}
+                                </strong></small>
+                                <small class="message-time">{{ message.timestamp.strftime('%d.%m.%Y %H:%M') }}</small>
                             </div>
 
                             {% if message.content %}
@@ -51,10 +53,16 @@
                             </div>
                             {% endfor %}
 
-                            {% if not message.is_read and message.sender_id == current_user.id %}
+                            {% if message.sender_id == current_user.id %}
+                            {% if message.is_read %}
+                            <small class="text-success d-block text-end">
+                                <i class="bi bi-check2-all"></i> Прочитано
+                            </small>
+                            {% else %}
                             <small class="text-muted d-block text-end">
                                 <i class="bi bi-check"></i> Доставлено
                             </small>
+                            {% endif %}
                             {% endif %}
                         </div>
                     </div>
@@ -68,27 +76,383 @@
             </div>
 
             <div class="card-footer">
-                <form method="POST" action="{{ url_for('chat', user_id=recipient.id) }}">
+                <div class="alert alert-warning d-none mb-3" id="connection-warning">
+                    <i class="bi bi-exclamation-triangle me-2"></i>
+                    Потеряно соединение с сервером. Пытаемся подключиться...
+                </div>
+
+                <form id="message-form">
                     <div class="input-group mb-3">
-                        <textarea class="form-control" name="content" rows="2"
-                                 placeholder="Введите сообщение..."></textarea>
+                        <textarea class="form-control" name="content" rows="2" id="message-input"
+                                 placeholder="Введите сообщение..." required></textarea>
                         <button class="btn btn-primary" type="submit">
                             <i class="bi bi-send"></i>
                         </button>
                     </div>
                 </form>
 
-                <form method="POST" action="{{ url_for('upload_file', recipient_id=recipient.id) }}" enctype="multipart/form-data">
+                <form id="file-form" class="mt-3">
                     <div class="input-group">
-                        <input type="file" class="form-control" name="file" required>
-                        <button class="btn btn-outline-secondary" type="submit">
+                        <input type="file" class="form-control" id="file-input">
+                        <button class="btn btn-outline-secondary" type="button" id="file-button">
                             <i class="bi bi-paperclip"></i> Прикрепить файл
                         </button>
                     </div>
                     <small class="text-muted">Файлы хранятся не более {{ config['FILE_LIFETIME'] }} дней</small>
+                    <div class="progress mt-2 d-none" id="file-progress" style="height: 5px;">
+                        <div class="progress-bar" role="progressbar" style="width: 0%;"></div>
+                    </div>
                 </form>
             </div>
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Инициализация чата
+    document.addEventListener('DOMContentLoaded', function() {
+        console.log("Initializing chat...");
+
+        // Сохраняем контекст чата
+        window.chatContext = {
+            currentUserId: {{ current_user.id }},
+            recipientId: {{ recipient.id }},
+            recipientName: "{{ recipient.fullname }}"
+        };
+
+        // Элементы UI
+        const messageBox = document.getElementById('message-box');
+        const messageForm = document.getElementById('message-form');
+        const messageInput = document.getElementById('message-input');
+        const fileButton = document.getElementById('file-button');
+        const connectionWarning = document.getElementById('connection-warning');
+
+        // Прокрутка вниз при загрузке
+        messageBox.scrollTop = messageBox.scrollHeight;
+
+        // Обработчики событий
+        messageForm.addEventListener('submit', handleMessageSubmit);
+        fileButton.addEventListener('click', handleFileUpload);
+
+        // Инициализация WebSocket
+        initWebSocket();
+
+        // Функция инициализации WebSocket
+        function initWebSocket() {
+            if (window.socket) {
+                console.log("WebSocket available, setting up handlers");
+
+                // Обработка новых сообщений
+                window.socket.on('new_message', function(data) {
+                    console.log("New message received:", data);
+
+                    // Проверяем, относится ли сообщение к текущему чату
+                    if ((data.sender_id === chatContext.currentUserId &&
+                         data.recipient_id === chatContext.recipientId) ||
+                        (data.sender_id === chatContext.recipientId &&
+                         data.recipient_id === chatContext.currentUserId)) {
+
+                        // Форматируем время для сообщения
+                        const timestamp = new Date(data.timestamp);
+                        data.formattedTime = formatTime(timestamp);
+
+                        // Добавляем сообщение в чат
+                        addMessageToChat(data);
+
+                        // Помечаем как прочитанное, если это входящее сообщение
+                        if (data.sender_id === chatContext.recipientId) {
+                            markMessageAsRead(data.id);
+                        }
+
+                        // Прокручиваем вниз
+                        messageBox.scrollTop = messageBox.scrollHeight;
+
+                        // Воспроизводим звук для входящих сообщений
+                        if (data.sender_id === chatContext.recipientId) {
+                            playNotificationSound();
+                        }
+                    }
+                });
+
+                // Обработка ошибок соединения
+                window.socket.on('connect_error', function(error) {
+                    console.error("WebSocket connection error:", error);
+                    showConnectionWarning(true);
+                });
+
+                window.socket.on('connect', function() {
+                    console.log("WebSocket reconnected");
+                    showConnectionWarning(false);
+                });
+
+                // Присоединяемся к комнате чата
+                joinChatRoom();
+            } else {
+                console.warn("WebSocket not available, using HTTP only");
+            }
+        }
+
+        // Функция присоединения к комнате чата
+        function joinChatRoom() {
+            if (window.socket && window.socket.connected) {
+                console.log("Joining chat room for recipient:", chatContext.recipientId);
+                window.socket.emit('join_chat', {
+                    recipient_id: chatContext.recipientId
+                });
+            }
+        }
+
+        // Функция обработки отправки сообщения
+        function handleMessageSubmit(e) {
+            e.preventDefault();
+            const content = messageInput.value.trim();
+
+            if (!content) return;
+
+            // Создаем временное сообщение
+            const tempMessage = {
+                id: 'temp-' + Date.now(),
+                sender_id: chatContext.currentUserId,
+                recipient_id: chatContext.recipientId,
+                sender_name: 'Вы',
+                content: content,
+                timestamp: new Date().toISOString(),
+                formattedTime: formatTime(new Date()),
+                is_read: false,
+                files: []
+            };
+
+            addMessageToChat(tempMessage);
+
+            // Отправляем на сервер
+            sendMessageToServer(content);
+
+            // Очищаем поле ввода
+            messageInput.value = '';
+            messageInput.focus();
+        }
+
+        // Функция отправки сообщения на сервер
+        function sendMessageToServer(content) {
+            fetch('/send_message', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: JSON.stringify({
+                    recipient_id: chatContext.recipientId,
+                    content: content
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    // Обновляем временное сообщение
+                    const tempMsg = document.querySelector(`[id="message-${tempMessage.id}"]`);
+                    if (tempMsg) {
+                        tempMsg.id = `message-${data.message_id}`;
+                        const statusEl = tempMsg.querySelector('.delivery-status');
+                        if (statusEl) {
+                            statusEl.innerHTML = '<i class="bi bi-check"></i> Доставлено';
+                        }
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error sending message:', error);
+                showError('Не удалось отправить сообщение');
+            });
+        }
+
+        // Функция обработки загрузки файла
+        function handleFileUpload() {
+            const fileInput = document.getElementById('file-input');
+            const file = fileInput.files[0];
+            if (!file) return alert('Выберите файл');
+
+            const progressBar = document.querySelector('#file-progress .progress-bar');
+            const progressContainer = document.getElementById('file-progress');
+            progressContainer.classList.remove('d-none');
+            progressBar.style.width = '0%';
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('recipient_id', chatContext.recipientId);
+
+            fetch('/upload/{{ recipient.id }}', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // Добавляем сообщение о файле
+                    const fileMessage = {
+                        id: data.message_id,
+                        sender_id: chatContext.currentUserId,
+                        recipient_id: chatContext.recipientId,
+                        sender_name: 'Вы',
+                        content: `Отправлен файл: ${file.name}`,
+                        timestamp: new Date().toISOString(),
+                        formattedTime: formatTime(new Date()),
+                        is_read: false,
+                        files: [{
+                            id: data.file_id,
+                            filename: file.name,
+                            filesize: file.size
+                        }]
+                    };
+
+                    addMessageToChat(fileMessage);
+                    playNotificationSound();
+                }
+            })
+            .catch(error => {
+                console.error('File upload error:', error);
+                showError('Не удалось отправить файл');
+            })
+            .finally(() => {
+                progressContainer.classList.add('d-none');
+                fileInput.value = '';
+            });
+        }
+
+        // Функция добавления сообщения в чат
+        function addMessageToChat(data) {
+            const isCurrentUser = (data.sender_id == chatContext.currentUserId);
+            const messageBoxClass = isCurrentUser ? 'sent-message' : 'received-message';
+            const senderName = isCurrentUser ? 'Вы' : chatContext.recipientName;
+
+            // Форматирование содержимого
+            let contentHtml = data.content ? `<p class="mb-1">${data.content}</p>` : '';
+
+            // Форматирование файлов
+            let fileHtml = '';
+            if (data.files && data.files.length > 0) {
+                fileHtml = data.files.map(file => `
+                    <div class="mb-2">
+                        <div class="d-flex align-items-center">
+                            <i class="bi bi-file-earmark me-2"></i>
+                            <div>
+                                <div class="fw-bold">${file.filename}</div>
+                                <small class="text-muted">
+                                    ${formatFileSize(file.filesize)} -
+                                    <a href="/download/${file.id}">Скачать</a>
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            // Статус доставки
+            let statusHtml = '';
+            if (isCurrentUser) {
+                statusHtml = data.is_read ?
+                    `<small class="text-success delivery-status"><i class="bi bi-check2-all"></i> Прочитано</small>` :
+                    `<small class="text-muted delivery-status"><i class="bi bi-check"></i> Доставлено</small>`;
+            }
+
+            // Создаем элемент сообщения
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `mb-3 ${isCurrentUser ? 'text-end' : ''}`;
+            messageDiv.id = `message-${data.id}`;
+            messageDiv.innerHTML = `
+                <div class="d-flex ${isCurrentUser ? 'justify-content-end' : 'justify-content-start'}">
+                    <div class="${messageBoxClass} p-3 rounded">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <small><strong>${senderName}</strong></small>
+                            <small>${data.formattedTime || formatTime(new Date(data.timestamp))}</small>
+                        </div>
+                        ${contentHtml}
+                        ${fileHtml}
+                        ${statusHtml}
+                    </div>
+                </div>
+            `;
+
+            messageBox.appendChild(messageDiv);
+            messageBox.scrollTop = messageBox.scrollHeight;
+        }
+
+        // Функция пометки сообщения как прочитанного
+        function markMessageAsRead(messageId) {
+            fetch(`/mark_as_read/${messageId}`, { method: 'POST' })
+                .catch(error => console.error('Error marking as read:', error));
+        }
+
+        // Функция для форматирования размера файла
+        function formatFileSize(bytes) {
+            if (!bytes) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        // Функция форматирования времени
+        function formatTime(date) {
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // Функция воспроизведения звука уведомления
+        function playNotificationSound() {
+            const audio = document.getElementById('notification-sound');
+            if (audio) {
+                audio.play().catch(e => console.log('Ошибка воспроизведения звука:', e));
+            }
+        }
+
+        // Функция показа ошибки
+        function showError(message) {
+            connectionWarning.textContent = message;
+            connectionWarning.classList.remove('d-none');
+
+            setTimeout(() => {
+                connectionWarning.classList.add('d-none');
+            }, 5000);
+        }
+
+        // Функция показа/скрытия предупреждения о соединении
+        function showConnectionWarning(show) {
+            if (show) {
+                connectionWarning.classList.remove('d-none');
+            } else {
+                connectionWarning.classList.add('d-none');
+            }
+        }
+    });
+</script>
+
+<style>
+    .sent-message {
+        background-color: #d1e7ff;
+        border-radius: 15px 15px 0 15px;
+        max-width: 75%;
+    }
+
+    .received-message {
+        background-color: #f1f0f0;
+        border-radius: 15px 15px 15px 0;
+        max-width: 75%;
+    }
+
+    .delivery-status {
+        font-size: 0.75rem;
+        margin-top: 5px;
+        text-align: right;
+    }
+
+    #file-progress {
+        transition: width 0.3s ease;
+    }
+
+    .message-time {
+        opacity: 0.7;
+        font-size: 0.8rem;
+    }
+</style>
 {% endblock %}
