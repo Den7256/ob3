@@ -30,7 +30,10 @@
                     </div>
                     <div>
                         <h6 class="card-title mb-0">{{ post.user.fullname }}</h6>
-                        <small class="text-muted">{{ post.timestamp.strftime('%d.%m.%Y в %H:%M') }}</small>
+                        <!-- Добавлен атрибут data-utc для коррекции времени -->
+                        <small class="text-muted post-time" data-utc="{{ post.timestamp.isoformat() }}">
+                            {{ post.timestamp.strftime('%d.%m.%Y в %H:%M') }}
+                        </small>
                     </div>
                 </div>
                 <p class="card-text">{{ post.content }}</p>
@@ -43,4 +46,32 @@
         {% endfor %}
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Функция для коррекции времени постов
+    function updatePostTimes() {
+        document.querySelectorAll('.post-time').forEach(el => {
+            const utcString = el.getAttribute('data-utc');
+            if (utcString) {
+                const date = new Date(utcString);
+                // Коррекция для Екатеринбурга (UTC+5)
+                date.setHours(date.getHours() + 5);
+
+                // Форматируем дату как "дд.мм.гггг в чч:мм"
+                const day = String(date.getDate()).padStart(2, '0');
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const year = date.getFullYear();
+                const hours = String(date.getHours()).padStart(2, '0');
+                const minutes = String(date.getMinutes()).padStart(2, '0');
+
+                el.textContent = `${day}.${month}.${year} в ${hours}:${minutes}`;
+            }
+        });
+    }
+
+    // Обновляем время при загрузке страницы
+    document.addEventListener('DOMContentLoaded', updatePostTimes);
+</script>
 {% endblock %}

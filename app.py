@@ -16,7 +16,7 @@ from sqlalchemy.orm import relationship
 from flask import abort
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask import copy_current_request_context
-
+from ldap3 import SUBTREE
 # Игнорируем предупреждения об устаревших методах
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -127,13 +127,14 @@ def get_chat_room_name(user1_id, user2_id):
 
 
 # Обработчики WebSocket
+
 @socketio.on('connect')
-def handle_connect(auth=None):  # Исправление: добавлен параметр auth
+def handle_connect(auth=None):
     print(f"⚡️ Новое подключение: {request.sid}")
     if 'user_id' in session:
         user_id = session['user_id']
         active_users[user_id] = request.sid
-        join_room(f"user_{user_id}")  # Присоединяем к личной комнате для уведомлений
+        join_room(f"user_{user_id}")
         print(f"👤 Пользователь {user_id} подключен. SID: {request.sid}")
         emit('connection_success', {'message': 'Успешное подключение к WebSocket'})
 
@@ -155,7 +156,6 @@ def handle_disconnect():
 
         # Отправляем обновленный список активных пользователей
         update_online_users()
-
 
 @socketio.on('join_chat')
 def handle_join_chat(data):
@@ -315,15 +315,17 @@ def update_online_users():
     online_user_ids = list(active_users.keys())
     online_users = User.query.filter(User.id.in_(online_user_ids)).all()
 
-    # Формируем список пользователей с базовой информацией
+    # Формируем список пользователей с необходимой информацией
     users_data = [{
         'id': user.id,
         'username': user.username,
-        'fullname': user.fullname
+        'fullname': user.fullname,
+        'department': user.department or '',
+        'position': user.position or ''
     } for user in online_users]
 
-    # ИСПРАВЛЕНИЕ: используем правильный метод для широковещательной рассылки
-    socketio.emit('online_users_update', {'users': users_data}, namespace='/')
+    # Отправляем всем клиентам
+    socketio.emit('online_users_update', {'users': users_data, 'online_ids': online_user_ids}, namespace='/')
     print(f"🔄 Отправлен обновленный список онлайн-пользователей: {len(online_users)} пользователей")
 
 
@@ -490,42 +492,80 @@ def verify_password(username, password):
         return None
 
 
+def get_ldap_attr(entry, attr_name, default=None):
+    """Безопасное извлечение атрибута из LDAP-записи"""
+    if hasattr(entry, attr_name) and getattr(entry, attr_name).value:
+        return getattr(entry, attr_name).value
+    return default
+
+
 @app.cli.command('sync-ad')
 def sync_ad_users():
     try:
         with app.app_context():
-            conn = get_ldap_connection(service_auth=True)
-            conn.search(
-                app.config['LDAP_USER_OU'],
-                '(objectClass=user)',
-                attributes=['sAMAccountName', 'displayName', 'mail', 'department', 'title']
-            )
-
+            ous = app.config['LDAP_USER_OU'].split(';')
             active_users = []
-            for entry in conn.entries:
-                username = entry.sAMAccountName.value
-                active_users.append(username)
+            conn = get_ldap_connection(service_auth=True)
 
-                user = User.query.filter_by(username=username).first()
-                if not user:
-                    user = User(username=username)
-                    db.session.add(user)
+            for ou in ous:
+                ou = ou.strip()
+                if not ou:
+                    continue
 
-                user.fullname = entry.displayName.value
-                user.email = entry.mail.value if 'mail' in entry and entry.mail.value else ''
-                user.department = entry.department.value if 'department' in entry and entry.department.value else ''
-                user.position = entry.title.value if 'title' in entry and entry.title.value else ''
-                user.is_active = True
+                try:
+                    print(f"🔍 Поиск пользователей в OU: {ou}")
+                    conn.search(
+                        search_base=ou,
+                        search_filter='(objectClass=user)',
+                        attributes=['sAMAccountName', 'displayName', 'mail', 'department', 'title'],
+                        search_scope=SUBTREE
+                    )
+
+                    for entry in conn.entries:
+                        username = get_ldap_attr(entry, 'sAMAccountName')
+                        if not username:
+                            print(f"⚠️ Пропуск записи без sAMAccountName")
+                            continue
+
+                        if username in active_users:
+                            print(f"⚠️ Пользователь {username} уже обработан, пропускаем дубликат")
+                            continue
+
+                        active_users.append(username)
+
+                        user = User.query.filter_by(username=username).first()
+                        if not user:
+                            user = User(username=username)
+                            db.session.add(user)
+                            print(f"➕ Добавлен новый пользователь: {username}")
+
+                        # Используем функцию для безопасного извлечения атрибутов
+                        user.fullname = get_ldap_attr(entry, 'displayName', username)
+                        user.email = get_ldap_attr(entry, 'mail', '')
+                        user.department = get_ldap_attr(entry, 'department', '')
+                        user.position = get_ldap_attr(entry, 'title', '')
+                        user.is_active = True
+
+                        print(f"🔄 Обновлен пользователь: {username} ({user.fullname})")
+
+                except Exception as ou_error:
+                    print(f"⚠️ Ошибка при обработке OU {ou}: {str(ou_error)}")
+                    continue
 
             inactive_users = User.query.filter(User.username.notin_(active_users)).all()
             for user in inactive_users:
                 user.is_active = False
+                print(f"⏸️ Пользователь деактивирован: {user.username}")
 
             db.session.commit()
-            print(f"✅ Синхронизировано {len(active_users)} пользователей")
+            print(f"✅ Синхронизация завершена. Пользователей: {len(active_users)}, "
+                  f"Деактивировано: {len(inactive_users)}")
+
     except Exception as e:
-        print(f"❌ Ошибка синхронизации: {str(e)}")
+        print(f"❌ Критическая ошибка синхронизации: {str(e)}")
         db.session.rollback()
+        import traceback
+        traceback.print_exc()
 
 
 def cleanup_old_files():
@@ -582,8 +622,59 @@ def create_post():
 @app.route('/users')
 @auth.login_required
 def users():
-    user_list = User.query.filter_by(is_active=True).all()
-    return render_template('users.html', users=user_list)
+    # Получаем ID всех онлайн пользователей
+    online_user_ids = list(active_users.keys())
+
+    # Получаем текущего пользователя и его отдел
+    current_user = User.query.get(session['user_id'])
+    current_department = current_user.department if current_user else None
+
+    # Получаем всех активных пользователей
+    users = User.query.filter_by(is_active=True).all()
+
+    # Сортируем пользователей по группам:
+    # 1. Онлайн из текущего отдела
+    online_same_dept = []
+    # 2. Онлайн из других отделов
+    online_other_dept = []
+    # 3. Офлайн из текущего отдела
+    offline_same_dept = []
+    # 4. Офлайн из других отделов
+    offline_other_dept = []
+
+    for user in users:
+        if user.id in online_user_ids:
+            if user.department == current_department:
+                online_same_dept.append(user)
+            else:
+                online_other_dept.append(user)
+        else:
+            if user.department == current_department:
+                offline_same_dept.append(user)
+            else:
+                offline_other_dept.append(user)
+
+    # Сортируем каждую группу по алфавиту (по полному имени)
+    online_same_dept.sort(key=lambda u: u.fullname)
+    online_other_dept.sort(key=lambda u: u.fullname)
+    offline_same_dept.sort(key=lambda u: u.fullname)
+    offline_other_dept.sort(key=lambda u: u.fullname)
+
+    # Объединяем списки
+    sorted_users = online_same_dept + online_other_dept + offline_same_dept + offline_other_dept
+
+    # Получаем уникальные отделы
+    departments = set()
+    for user in users:
+        if user.department and user.department.strip():
+            departments.add(user.department)
+    departments = sorted(departments)
+
+    return render_template('users.html',
+                           users=sorted_users,
+                           departments=departments,
+                           online_user_ids=online_user_ids,
+                           current_user=current_user)
 
 
 @app.route('/profile/<username>')
@@ -996,6 +1087,11 @@ def send_message_http():
         db.session.rollback()
         print(f"Error sending message: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+
+
+
 
 
 # Инициализация приложения

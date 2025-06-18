@@ -1,32 +1,120 @@
 {% extends "base.html" %}
-{% block title %}Сотрудники{% endblock %}
+{% block title %}Сотрудники компании{% endblock %}
 
 {% block content %}
 <div class="row">
     <div class="col-lg-8 mx-auto">
-        <div class="card">
-            <div class="card-header bg-primary text-white">
-                <h5 class="mb-0">
-                    <i class="bi bi-people me-2"></i>Сотрудники
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0">
+                    <i class="bi bi-people-fill me-2"></i>Список сотрудников
+                    {% if current_user.department %}
+                    <span class="badge bg-info float-end">Ваш отдел: {{ current_user.department }}</span>
+                    {% endif %}
                 </h5>
             </div>
             <div class="card-body">
-                <div class="list-group">
-                    {% for user in users %}
+                <div class="d-flex flex-column flex-md-row gap-3 mb-3">
+                    <!-- Фильтр по отделам -->
+                    <div class="flex-grow-1">
+                        <select id="departmentFilter" class="form-select">
+                            <option value="">Все отделы</option>
+                            {% for dept in departments %}
+                            <option value="{{ dept }}"
+                                {% if dept == current_user.department %}selected{% endif %}>
+                                {{ dept }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <!-- Поиск по имени -->
+                    <div class="input-group flex-grow-1">
+                        <input type="text" id="searchInput" class="form-control" placeholder="Поиск сотрудников...">
+                        <button class="btn btn-outline-secondary" type="button">
+                            <i class="bi bi-search"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="list-group" id="userList">
+                    <!-- Заголовок для онлайн пользователей -->
+                    <div class="list-group-item list-group-item-primary fw-bold">
+                        <i class="bi bi-wifi"></i> Сейчас онлайн
+                        <span class="badge bg-success float-end">{{ online_user_ids|length }} пользователей</span>
+                    </div>
+
+                    {% for user in users if user.id in online_user_ids %}
                     <a href="{{ url_for('user_profile', username=user.username) }}"
-                       class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
+                       class="list-group-item list-group-item-action user-item"
+                       data-department="{{ user.department|default('', true) }}"
+                       data-online="true">
                         <div class="d-flex align-items-center">
-                            <div class="user-avatar me-3 position-relative" data-user-id="{{ user.id }}">
+                            <div class="user-avatar me-3 position-relative">
                                 <i class="bi bi-person-fill"></i>
-                                <!-- Индикатор онлайн будет добавлен скриптом -->
+                                <span class="position-absolute top-0 start-100 translate-middle p-1 bg-success border border-light rounded-circle">
+                                    <span class="visually-hidden">Online</span>
+                                </span>
                             </div>
                             <div>
-                                <h6 class="mb-0">{{ user.fullname }}</h6>
-                                <small class="text-muted">{{ user.department }} • {{ user.position }}</small>
+                                <h6 class="mb-1">{{ user.fullname }}</h6>
+                                <div class="d-flex">
+                                    {% if user.position %}
+                                    <span class="badge bg-primary me-2">{{ user.position }}</span>
+                                    {% endif %}
+                                    {% if user.department %}
+                                    <span class="badge bg-secondary department-badge">
+                                        {{ user.department }}
+                                        {% if user.department == current_user.department %}
+                                        <i class="bi bi-people-fill ms-1"></i>
+                                        {% endif %}
+                                    </span>
+                                    {% endif %}
+                                </div>
                             </div>
                         </div>
-                        <div class="user-status" data-user-id="{{ user.id }}">
-                            <span class="badge bg-secondary">Офлайн</span>
+                    </a>
+                    {% else %}
+                    <div class="list-group-item">
+                        <div class="text-muted text-center py-2">
+                            Нет активных пользователей
+                        </div>
+                    </div>
+                    {% endfor %}
+
+                    <!-- Заголовок для офлайн пользователей -->
+                    <div class="list-group-item list-group-item-secondary fw-bold mt-3">
+                        <i class="bi bi-moon"></i> Не в сети
+                    </div>
+
+                    {% for user in users if user.id not in online_user_ids %}
+                    <a href="{{ url_for('user_profile', username=user.username) }}"
+                       class="list-group-item list-group-item-action user-item"
+                       data-department="{{ user.department|default('', true) }}"
+                       data-online="false">
+                        <div class="d-flex align-items-center">
+                            <div class="user-avatar me-3 position-relative">
+                                <i class="bi bi-person-fill"></i>
+                                <span class="position-absolute top-0 start-100 translate-middle p-1 bg-secondary border border-light rounded-circle">
+                                    <span class="visually-hidden">Offline</span>
+                                </span>
+                            </div>
+                            <div>
+                                <h6 class="mb-1">{{ user.fullname }}</h6>
+                                <div class="d-flex">
+                                    {% if user.position %}
+                                    <span class="badge bg-primary me-2">{{ user.position }}</span>
+                                    {% endif %}
+                                    {% if user.department %}
+                                    <span class="badge bg-secondary department-badge">
+                                        {{ user.department }}
+                                        {% if user.department == current_user.department %}
+                                        <i class="bi bi-people-fill ms-1"></i>
+                                        {% endif %}
+                                    </span>
+                                    {% endif %}
+                                </div>
+                            </div>
                         </div>
                     </a>
                     {% endfor %}
@@ -35,4 +123,98 @@
         </div>
     </div>
 </div>
+
+<script>
+    // Функция для фильтрации сотрудников
+    function filterUsers() {
+        const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+        const department = document.getElementById('departmentFilter').value;
+        const items = document.querySelectorAll('#userList .user-item');
+
+        let visibleCount = 0;
+        let onlineHeaderVisible = false;
+        let offlineHeaderVisible = false;
+
+        items.forEach(item => {
+            const userName = item.querySelector('h6').textContent.toLowerCase();
+            const userDepartment = item.dataset.department;
+            const isOnline = item.dataset.online === "true";
+
+            // Проверяем соответствие фильтрам
+            const matchesSearch = userName.includes(searchTerm);
+            const matchesDepartment = !department || userDepartment === department;
+
+            if (matchesSearch && matchesDepartment) {
+                item.style.display = 'flex';
+                visibleCount++;
+
+                // Показываем соответствующий заголовок
+                if (isOnline) onlineHeaderVisible = true;
+                else offlineHeaderVisible = true;
+            } else {
+                item.style.display = 'none';
+            }
+        });
+
+        // Показываем/скрываем заголовки
+        document.querySelectorAll('.list-group-item-primary').forEach(el => {
+            el.style.display = onlineHeaderVisible ? 'block' : 'none';
+        });
+
+        document.querySelectorAll('.list-group-item-secondary').forEach(el => {
+            el.style.display = offlineHeaderVisible ? 'block' : 'none';
+        });
+
+        // Показываем сообщение, если ничего не найдено
+        const noResults = document.querySelector('.alert-warning');
+        if (visibleCount === 0) {
+            if (!noResults) {
+                const userList = document.getElementById('userList');
+                const alert = document.createElement('div');
+                alert.className = 'alert alert-warning mt-3';
+                alert.textContent = 'Сотрудники по вашему запросу не найдены';
+                userList.appendChild(alert);
+            }
+        } else if (noResults) {
+            noResults.remove();
+        }
+    }
+
+    // Инициализация обработчиков событий
+    document.addEventListener('DOMContentLoaded', function() {
+        // Поиск сотрудников
+        document.getElementById('searchInput').addEventListener('input', filterUsers);
+
+        // Фильтр по отделам
+        document.getElementById('departmentFilter').addEventListener('change', filterUsers);
+
+        // При загрузке выполняем фильтрацию для скрытия несоответствующих
+        filterUsers();
+    });
+</script>
+
+<style>
+    .user-avatar {
+        width: 40px;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #f0f0f0;
+        border-radius: 50%;
+    }
+    .department-badge {
+        max-width: 200px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        display: inline-block;
+    }
+    .list-group-item-primary, .list-group-item-secondary {
+        z-index: auto !important;
+    }
+    .position-absolute {
+        z-index: 1;
+    }
+</style>
 {% endblock %}
