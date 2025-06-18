@@ -681,7 +681,13 @@ def users():
 @auth.login_required
 def user_profile(username):
     user = User.query.filter_by(username=username, is_active=True).first_or_404()
-    return render_template('profile.html', profile_user=user)
+    # Получаем ID всех онлайн пользователей
+    online_user_ids = list(active_users.keys())
+    return render_template(
+        'profile.html',
+        profile_user=user,
+        online_user_ids=online_user_ids
+    )
 
 
 @app.route('/chat/<int:user_id>', methods=['GET', 'POST'])
