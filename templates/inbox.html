@@ -4,8 +4,11 @@
 {% block scripts %}
 <script>
     document.addEventListener('DOMContentLoaded', function() {
+        console.log("Инициализация страницы входящих сообщений...");
+
         // Устанавливаем текущего пользователя
         window.currentUserId = {{ current_user.id }};
+        console.log(`Текущий пользователь ID: ${window.currentUserId}`);
 
         // Функция для форматирования времени с коррекцией часового пояса
         function formatInboxTime(utcString) {
@@ -13,7 +16,7 @@
             // Коррекция для Екатеринбурга (UTC+5)
             date.setHours(date.getHours() + 5);
 
-            return date.toLocaleTimeString([], {
+            return date.toLocaleTimeString('ru-RU', {
                 hour: '2-digit',
                 minute: '2-digit',
                 day: '2-digit',
@@ -24,6 +27,7 @@
 
         // Обновляем все временные метки на странице
         function updateAllTimes() {
+            console.log("Обновление временных меток...");
             document.querySelectorAll('.message-time[data-utc]').forEach(el => {
                 const utcTime = el.getAttribute('data-utc');
                 if (utcTime) {
@@ -39,13 +43,15 @@
                 console.log('🔔 Получено обновление списка чатов:', data);
 
                 // Если это обновление для текущего пользователя
-                if (data.user_id === window.currentUserId) {
+                if (data.user_id == window.currentUserId) {
                     // Если это обновление статуса прочтения
                     if (data.is_read_update) {
+                        console.log('Обновление статуса прочтения');
                         updateConversationReadStatus(data.sender_id);
                     }
                     // Если это новое сообщение
                     else {
+                        console.log('Новое сообщение, обновляем разговор');
                         updateConversation(data);
                     }
                 }
@@ -54,6 +60,7 @@
 
         // Функция обновления статуса прочтения в разговоре
         function updateConversationReadStatus(sender_id) {
+            console.log(`Обновление статуса прочтения от отправителя: ${sender_id}`);
             const conversation = document.querySelector(`.list-group-item[data-user-id="${sender_id}"]`);
             if (conversation) {
                 const badge = conversation.querySelector('.unread-badge');
@@ -70,15 +77,19 @@
 
         // Функция обновления разговора при новом сообщении
         function updateConversation(data) {
+            console.log('Обновление разговора с данными:', data);
+
             // Определяем ID собеседника
             const userId = data.sender_id === window.currentUserId ?
                            data.recipient_id :
                            data.sender_id;
 
+            console.log(`Ищем разговор с пользователем ID: ${userId}`);
             // Ищем существующий разговор
             const conversation = document.querySelector(`.list-group-item[data-user-id="${userId}"]`);
 
             if (conversation) {
+                console.log('Разговор найден, обновляем...');
                 // Обновляем последнее сообщение
                 const contentElement = conversation.querySelector('.conversation-content');
                 if (contentElement) {
@@ -113,7 +124,9 @@
                 // Перемещаем разговор наверх
                 const listGroup = conversation.parentElement;
                 listGroup.insertBefore(conversation, listGroup.firstChild);
+                console.log('Разговор перемещен наверх');
             } else {
+                console.log('Разговор не найден, перезагружаем весь список');
                 // Если это новый разговор - перезагружаем весь список
                 loadInboxList();
             }
@@ -121,25 +134,34 @@
 
         // Функция перезагрузки списка чатов
         function loadInboxList() {
+            console.log('Загрузка списка чатов...');
             fetch('/inbox')
                 .then(response => response.text())
                 .then(html => {
+                    console.log('Получен HTML списка чатов');
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(html, 'text/html');
-                    const newList = doc.querySelector('.list-group');
-                    if (newList) {
-                        const container = document.querySelector('.list-group');
-                        container.parentNode.replaceChild(newList, container);
+
+                    // Заменяем весь контейнер чатов
+                    const newCardBody = doc.querySelector('.card-body');
+                    if (newCardBody) {
+                        const container = document.querySelector('.card-body');
+                        container.parentNode.replaceChild(newCardBody, container);
+                        console.log('Список чатов обновлен');
+
                         // Повторно инициализируем обработчики событий
                         initConversationHover();
+
                         // Обновляем временные метки
                         updateAllTimes();
                     }
-                });
+                })
+                .catch(error => console.error('Ошибка загрузки списка чатов:', error));
         }
 
         // Инициализация обработчиков наведения для разговоров
         function initConversationHover() {
+            console.log('Инициализация обработчиков наведения...');
             document.querySelectorAll('.list-group-item').forEach(item => {
                 item.addEventListener('mouseenter', function() {
                     const messageId = this.dataset.lastMessageId;
@@ -147,6 +169,7 @@
 
                     // Помечаем сообщения как прочитанные только если пользователь - получатель
                     if (messageId && recipientId && recipientId == window.currentUserId) {
+                        console.log(`Пометить как прочитанное сообщение ID: ${messageId}`);
                         fetch(`/mark_as_read/${messageId}`, { method: 'POST' })
                             .then(() => {
                                 // Удаляем бейдж после пометки как прочитанного
@@ -164,6 +187,13 @@
         // Первоначальная инициализация
         updateAllTimes();  // Обновляем все временные метки
         initConversationHover();
+
+        // Проверяем подключение к WebSocket
+        if (window.socket) {
+            console.log('WebSocket подключен');
+        } else {
+            console.warn('WebSocket не подключен');
+        }
     });
 </script>
 {% endblock %}
@@ -177,7 +207,7 @@
                     <i class="bi bi-inbox me-2"></i>Входящие сообщения
                 </h5>
             </div>
-            <div class="card-body">
+            <div class="card-body" id="inbox-container">
                 {% if conversations %}
                 <div class="list-group">
                     {% for message, user in conversations %}

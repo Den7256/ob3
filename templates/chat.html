@@ -3,21 +3,76 @@
 
 {% block content %}
 <div class="row">
-    <div class="col-lg-8 mx-auto">
+    <!-- Левая колонка: Список чатов -->
+    <div class="col-lg-4">
+        <div class="card mb-4">
+            <div class="card-header bg-primary text-white">
+                <h5 class="mb-0">
+                    <i class="bi bi-inbox me-2"></i>Ваши диалоги
+                </h5>
+            </div>
+            <div class="card-body p-0">
+                {% if conversations %}
+                <div class="list-group list-group-flush">
+                    {% for message, user in conversations %}
+                    <a href="{{ url_for('chat', user_id=user.id) }}"
+                       class="list-group-item list-group-item-action {% if user.id == recipient.id %}active-chat{% endif %}"
+                       data-last-message-id="{{ message.id }}"
+                       data-user-id="{{ user.id }}">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="d-flex align-items-center">
+                                <div class="position-relative me-2">
+                                    <div class="user-avatar-sm">
+                                        <i class="bi bi-person-fill"></i>
+                                    </div>
+                                    {% if unread_counts[user.id] > 0 %}
+                                    <span class="badge bg-danger unread-badge">
+                                        {{ unread_counts[user.id] }}
+                                    </span>
+                                    {% endif %}
+                                </div>
+                                <div>
+                                    <h6 class="mb-0">{{ user.fullname }}</h6>
+                                    <small class="conversation-content text-truncate d-block" style="max-width: 200px;">
+                                        {% if message.sender_id == current_user.id %}
+                                        <strong>Вы:</strong>
+                                        {% endif %}
+                                        {{ message.content|truncate(30) }}
+                                    </small>
+                                </div>
+                            </div>
+                            <!-- Исправлено: Добавлено форматирование времени с коррекцией часового пояса -->
+                            <small class="message-time" data-utc="{{ message.timestamp.isoformat() }}"></small>
+                        </div>
+                    </a>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <div class="text-center p-4">
+                    <i class="bi bi-chat-left-text" style="font-size: 3rem; color: #6c757d;"></i>
+                    <p class="mt-3">Нет активных диалогов</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Правая колонка: Текущий чат -->
+    <div class="col-lg-8">
         <div class="card">
             <div class="card-header d-flex justify-content-between align-items-center">
                 <div class="d-flex align-items-center">
-                    <div class="user-avatar me-2" data-user-id="{{ recipient.id }}">
+                    <div class="user-avatar me-2">
                         <i class="bi bi-person-fill"></i>
                     </div>
-                    <h5 class="mb-0">Чат с {{ recipient.fullname }}</h5>
+                    <h5 class="mb-0" id="chat-title">Чат с {{ recipient.fullname }}</h5>
                 </div>
                 <div>
-                    <a href="{{ url_for('user_profile', username=recipient.username) }}" class="btn btn-sm btn-outline-secondary me-1">
+                    <a href="{{ url_for('user_profile', username=recipient.username) }}" class="btn btn-sm btn-outline-secondary me-1" id="profile-link">
                         <i class="bi bi-person"></i> Профиль
                     </a>
                     <a href="{{ url_for('inbox') }}" class="btn btn-sm btn-outline-primary">
-                        <i class="bi bi-arrow-left"></i> Назад
+                        <i class="bi bi-inbox"></i> Входящие
                     </a>
                 </div>
             </div>
@@ -69,7 +124,8 @@
         window.chatContext = {
             currentUserId: {{ current_user.id }},
             recipientId: {{ recipient.id }},
-            recipientName: "{{ recipient.fullname }}"
+            recipientName: "{{ recipient.fullname }}",
+            recipientUsername: "{{ recipient.username }}"
         };
 
         // Элементы UI
@@ -78,6 +134,9 @@
         const messageInput = document.getElementById('message-input');
         const fileButton = document.getElementById('file-button');
         const connectionWarning = document.getElementById('connection-warning');
+        const profileLink = document.getElementById('profile-link');
+        const chatTitle = document.getElementById('chat-title');
+        let currentChatRoom = null;
 
         // Добавляем обработчик клавиш для textarea
         messageInput.addEventListener('keydown', function(e) {
@@ -99,6 +158,177 @@
 
         // Инициализация WebSocket
         initWebSocket();
+
+        // Обновляем временные метки в списке чатов
+        updateAllTimes();
+
+        // Обработчик клика по диалогам в списке
+        document.querySelectorAll('.list-group-item').forEach(item => {
+            item.addEventListener('click', function(e) {
+                e.preventDefault();
+                const userId = this.dataset.userId;
+                if (userId && userId != chatContext.recipientId) {
+                    // Обновляем URL без перезагрузки страницы
+                    window.history.pushState(null, null, `/chat/${userId}`);
+                    // Загружаем новый чат
+                    loadNewChat(userId);
+                }
+            });
+        });
+
+        // Обработка навигации по истории браузера
+        window.addEventListener('popstate', function() {
+            const pathParts = window.location.pathname.split('/');
+            const userId = pathParts[pathParts.length - 1];
+            if (userId && !isNaN(userId)) {
+                loadNewChat(parseInt(userId));
+            }
+        });
+
+        // Функция загрузки нового чата
+        function loadNewChat(userId) {
+            console.log(`Загрузка нового чата с пользователем ID: ${userId}`);
+
+            // Показываем индикатор загрузки
+            messageBox.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div></div>';
+
+            // Добавляем класс обновления для плавного перехода
+            document.querySelector('.card-header').classList.add('chat-header-updating');
+
+            // Помечаем все сообщения от предыдущего собеседника как прочитанные
+            if (chatContext.recipientId) {
+                markAllMessagesAsRead(chatContext.recipientId);
+            }
+
+            // Выходим из текущей комнаты
+            if (window.socket && currentChatRoom) {
+                window.socket.emit('leave_room', {room: currentChatRoom});
+                console.log("Выход из предыдущей комнаты чата:", currentChatRoom);
+                currentChatRoom = null;
+            }
+
+            // Обновляем активный элемент в списке
+            document.querySelectorAll('.list-group-item').forEach(item => {
+                item.classList.remove('active-chat');
+                if (parseInt(item.dataset.userId) === userId) {
+                    item.classList.add('active-chat');
+                }
+            });
+
+            // Загружаем информацию о новом пользователе
+            fetch(`/user_info/${userId}`)
+                .then(response => response.json())
+                .then(data => {
+                    // Обновляем контекст чата
+                    chatContext.recipientId = userId;
+                    chatContext.recipientName = data.fullname;
+                    chatContext.recipientUsername = data.username;
+
+                    // Обновляем заголовок чата
+                    chatTitle.textContent = `Чат с ${data.fullname}`;
+
+                    // Обновляем ссылку на профиль
+                    if (profileLink) {
+                        profileLink.href = `/user_profile/${data.username}`;
+                    }
+
+                    // Обновляем title страницы
+                    document.title = `Чат с ${data.fullname}`;
+
+                    // Обновляем форму отправки файла
+                    const fileForm = document.getElementById('file-form');
+                    if (fileForm) {
+                        fileForm.action = `/upload/${userId}`;
+                    }
+
+                    // Присоединяемся к новой комнате чата
+                    joinChatRoom();
+
+                    // Обновляем информацию о присутствии на сервере
+                    updatePresence();
+
+                    // Загружаем историю сообщений
+                    loadChatHistory();
+
+                    // Убираем класс обновления после завершения
+                    setTimeout(() => {
+                        document.querySelector('.card-header').classList.remove('chat-header-updating');
+                    }, 300);
+                })
+                .catch(error => {
+                    console.error('Ошибка загрузки информации о пользователе:', error);
+                    showError('Не удалось загрузить информацию о пользователе');
+                    document.querySelector('.card-header').classList.remove('chat-header-updating');
+                });
+        }
+
+        // Функция обновления информации о присутствии на сервере
+        function updatePresence() {
+            if (window.socket && chatContext.recipientId) {
+                window.socket.emit('update_presence', {
+                    recipient_id: chatContext.recipientId
+                });
+                console.log("🔄 Отправка обновления присутствия на сервер");
+            }
+        }
+
+        // Функция пометки всех входящих сообщений от конкретного отправителя как прочитанных
+        function markAllMessagesAsRead(senderId) {
+            // Отправляем запрос на сервер для пометки всех сообщений как прочитанных
+            fetch(`/mark_all_as_read/${senderId}`, { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        console.log(`Все сообщения от ${senderId} помечены как прочитанные`);
+                        // Обновляем счетчик в левой панели
+                        updateUnreadBadge(senderId, 0);
+                        // Обновляем глобальный счетчик
+                        updateGlobalUnreadCount();
+                    }
+                })
+                .catch(error => console.error('Ошибка пометки всех сообщений как прочитанных:', error));
+        }
+
+        // Функция обновления счетчика непрочитанных в левой панели
+        function updateUnreadBadge(userId, count) {
+            const conversation = document.querySelector(`.list-group-item[data-user-id="${userId}"]`);
+            if (conversation) {
+                const badge = conversation.querySelector('.unread-badge');
+
+                if (count > 0) {
+                    if (badge) {
+                        badge.textContent = count;
+                    } else {
+                        const newBadge = document.createElement('span');
+                        newBadge.className = 'badge bg-danger unread-badge';
+                        newBadge.textContent = count;
+                        const container = conversation.querySelector('.position-relative');
+                        if (container) {
+                            container.appendChild(newBadge);
+                        }
+                    }
+                } else if (badge) {
+                    badge.remove();
+                }
+            }
+        }
+
+        // Функция обновления глобального счетчика непрочитанных сообщений
+        function updateGlobalUnreadCount() {
+            fetch('/unread_count')
+                .then(response => response.json())
+                .then(data => {
+                    const badge = document.querySelector('.unread-count-badge');
+                    if (badge) {
+                        if (data.count > 0) {
+                            badge.textContent = data.count;
+                            badge.style.display = 'inline-block';
+                        } else {
+                            badge.style.display = 'none';
+                        }
+                    }
+                });
+        }
 
         // Функция загрузки истории сообщений
         function loadChatHistory() {
@@ -122,111 +352,48 @@
                     messageBox.scrollTop = messageBox.scrollHeight;
 
                     // Помечаем все входящие сообщения как прочитанные
-                    markAllMessagesAsRead();
+                    markAllMessagesAsRead(chatContext.recipientId);
                 })
                 .catch(error => {
                     console.error('Ошибка загрузки истории:', error);
+                    showError('Не удалось загрузить историю сообщений');
                 });
-        }
-
-        // Функция инициализации WebSocket
-        function initWebSocket() {
-            if (window.socket) {
-                console.log("WebSocket available, setting up handlers");
-
-                // Обработка новых сообщений
-                window.socket.on('new_message', function(data) {
-                    console.log("New message received:", data);
-
-                    // Проверяем, относится ли сообщение к текущему чату
-                    if ((data.sender_id === chatContext.currentUserId &&
-                         data.recipient_id === chatContext.recipientId) ||
-                        (data.sender_id === chatContext.recipientId &&
-                         data.recipient_id === chatContext.currentUserId)) {
-
-                        // Игнорируем собственные сообщения, которые уже были добавлены как временные
-                        if (data.sender_id === chatContext.currentUserId) {
-                            console.log("Это наше сообщение, пропускаем добавление");
-                            return;
-                        }
-
-                        // Добавляем сообщение в чат
-                        addMessageToChat(data, false);
-
-                        // Помечаем как прочитанное, если это входящее сообщение
-                        if (data.sender_id === chatContext.recipientId) {
-                            markMessageAsRead(data.id);
-                        }
-
-                        // Прокручиваем вниз
-                        messageBox.scrollTop = messageBox.scrollHeight;
-
-                        // Воспроизводим звук для входящих сообщений
-                        if (data.sender_id === chatContext.recipientId) {
-                            playNotificationSound();
-                        }
-                    }
-                });
-
-                // Обработка подтверждения доставки
-                window.socket.on('message_delivered', function(data) {
-                    console.log('Подтверждение доставки:', data);
-                    const tempMsg = document.querySelector(`[data-temp-id="${data.temp_id}"]`);
-                    if (tempMsg) {
-                        // Заменяем временный ID на реальный
-                        tempMsg.id = `message-${data.message_id}`;
-                        tempMsg.removeAttribute('data-temp-id');
-                        const statusEl = tempMsg.querySelector('.delivery-status');
-                        if (statusEl) {
-                            statusEl.innerHTML = '<i class="bi bi-check"></i> Доставлено';
-                        }
-                    }
-                });
-
-                // Обработка обновления статуса прочтения
-                window.socket.on('message_read', function(data) {
-                    console.log('Статус прочтения обновлен:', data);
-                    const messageElement = document.getElementById(`message-${data.message_id}`);
-                    if (messageElement) {
-                        const statusEl = messageElement.querySelector('.delivery-status');
-                        if (statusEl) {
-                            statusEl.innerHTML = '<i class="bi bi-check2-all"></i> Прочитано';
-                            statusEl.classList.remove('text-muted');
-                            statusEl.classList.add('text-success');
-                        }
-                    }
-                });
-
-                // Обработка ошибок соединения
-                window.socket.on('connect_error', function(error) {
-                    console.error("WebSocket connection error:", error);
-                    showConnectionWarning(true);
-                });
-
-                window.socket.on('connect', function() {
-                    console.log("WebSocket reconnected");
-                    showConnectionWarning(false);
-                    // При переподключении присоединяемся к комнате чата
-                    joinChatRoom();
-                });
-
-                // Присоединяемся к комнате чата
-                joinChatRoom();
-            } else {
-                console.warn("WebSocket not available, using HTTP only");
-            }
         }
 
         // Функция присоединения к комнате чата
         function joinChatRoom() {
             if (window.socket && window.socket.connected) {
-                console.log("Joining chat room for recipient:", chatContext.recipientId);
+                // Формируем уникальное имя комнаты для текущего чата
+                const room = getChatRoomName(chatContext.currentUserId, chatContext.recipientId);
+
+                console.log("Присоединение к комнате чата:", room);
+
+                // Выходим из предыдущей комнаты (если она есть и отличается от новой)
+                if (currentChatRoom && currentChatRoom !== room) {
+                    window.socket.emit('leave_room', {room: currentChatRoom});
+                    console.log("Выход из предыдущей комнаты:", currentChatRoom);
+                }
+
+                // Присоединяемся к новой комнате
                 window.socket.emit('join_chat', {
-                    recipient_id: chatContext.recipientId
+                    recipient_id: chatContext.recipientId,
+                    room: room
                 });
+
+                // Сохраняем текущую комнату
+                currentChatRoom = room;
+                console.log("Успешно присоединились к комнате:", currentChatRoom);
             } else {
-                console.warn("Socket not connected, cannot join chat room");
+                console.warn("Сокет не подключен, невозможно присоединиться к комнате чата");
             }
+        }
+
+        // Функция генерации имени комнаты для чата
+        function getChatRoomName(userId1, userId2) {
+            const id1 = parseInt(userId1);
+            const id2 = parseInt(userId2);
+            const ids = [id1, id2].sort((a, b) => a - b);
+            return `chat_${ids[0]}_${ids[1]}`;
         }
 
         // Функция отправки сообщения
@@ -254,10 +421,11 @@
                 window.socket.emit('send_message', {
                     recipient_id: chatContext.recipientId,
                     content: content,
-                    temp_id: temp_id  // Передаем временный ID
+                    temp_id: temp_id,  // Передаем временный ID
+                    room: currentChatRoom  // Указываем целевую комнату
                 });
             } else {
-                console.warn("WebSocket not available, message not sent");
+                console.warn("WebSocket недоступен, сообщение не отправлено");
             }
 
             // Очищаем поле ввода
@@ -280,7 +448,7 @@
             formData.append('file', file);
             formData.append('recipient_id', chatContext.recipientId);
 
-            fetch('/upload/{{ recipient.id }}', {
+            fetch(`/upload/${chatContext.recipientId}`, {
                 method: 'POST',
                 body: formData
             })
@@ -342,7 +510,7 @@
                 }
             }
 
-            // Форматируем время (добавляем 5 часов для Екатеринбурга)
+            // Форматируем время с учетом локального часового пояса
             const localTime = formatTime(data.timestamp);
 
             // Создаем элемент сообщения
@@ -381,6 +549,15 @@
                         console.log(`Сообщение ${messageId} помечено как прочитанное`);
                         // Обновляем статус в UI
                         updateMessageStatus(messageId, true);
+
+                        // Обновляем счетчик в левой панели
+                        const userId = chatContext.recipientId;
+                        const currentBadge = document.querySelector(`.list-group-item[data-user-id="${userId}"] .unread-badge`);
+                        const currentCount = currentBadge ? parseInt(currentBadge.textContent) - 1 : 0;
+                        updateUnreadBadge(userId, currentCount);
+
+                        // Обновляем глобальный счетчик
+                        updateGlobalUnreadCount();
                     }
                 })
                 .catch(error => console.error('Error marking as read:', error));
@@ -407,21 +584,6 @@
             }
         }
 
-        // Функция пометки всех входящих сообщений как прочитанных
-        function markAllMessagesAsRead() {
-            // Находим все непрочитанные сообщения от этого отправителя
-            const unreadMessages = document.querySelectorAll('.received-message .delivery-status');
-            unreadMessages.forEach(statusEl => {
-                const messageElement = statusEl.closest('.mb-3');
-                if (messageElement) {
-                    const messageId = messageElement.id.replace('message-', '');
-                    if (messageId) {
-                        markMessageAsRead(messageId);
-                    }
-                }
-            });
-        }
-
         // Функция для форматирования размера файла
         function formatFileSize(bytes) {
             if (!bytes) return '0 B';
@@ -431,17 +593,34 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
         }
 
-        // Функция форматирования времени (добавляем 5 часов к UTC)
+        // Функция форматирования времени (корректная для часового пояса)
         function formatTime(utcString) {
             const date = new Date(utcString);
-            // Добавляем 5 часов для Екатеринбурга (UTC+5)
-            date.setHours(date.getHours() + 5);
-            return date.toLocaleTimeString([], {
+            return date.toLocaleTimeString('ru-RU', {
                 hour: '2-digit',
                 minute: '2-digit',
                 day: '2-digit',
                 month: '2-digit',
                 year: 'numeric'
+            });
+        }
+
+        // Функция обновления временных меток в списке чатов
+        function updateAllTimes() {
+            document.querySelectorAll('.message-time[data-utc]').forEach(el => {
+                const utcTime = el.getAttribute('data-utc');
+                if (utcTime) {
+                    const date = new Date(utcTime);
+
+                    // Коррекция часового пояса: добавляем 5 часов для Екатеринбурга (UTC+5)
+                    const localTime = new Date(date.getTime() + 5 * 60 * 60 * 1000);
+
+                    // Форматируем только время (часы:минуты)
+                    el.textContent = localTime.toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                }
             });
         }
 
@@ -471,9 +650,131 @@
                 connectionWarning.classList.add('d-none');
             }
         }
+
+        // Инициализация WebSocket
+        function initWebSocket() {
+            if (window.socket) {
+                console.log("WebSocket доступен, настройка обработчиков соединения");
+
+                // Обработка ошибок соединения
+                window.socket.on('connect_error', function(error) {
+                    console.error("Ошибка подключения WebSocket:", error);
+                    showConnectionWarning(true);
+                });
+
+                // Обработка восстановления соединения
+                window.socket.on('connect', function() {
+                    console.log("WebSocket подключен/переподключен");
+                    showConnectionWarning(false);
+
+                    // При переподключении присоединяемся к комнате чата
+                    joinChatRoom();
+
+                    // Обновляем информацию о присутствии
+                    updatePresence();
+
+                    // Обновляем данные чата
+                    loadChatHistory();
+                });
+
+                // Обработка новых сообщений
+                window.socket.on('new_message', function(data) {
+                    console.log("Получено новое сообщение:", data);
+
+                    // Проверяем, относится ли сообщение к текущему чату
+                    if ((data.sender_id === chatContext.currentUserId &&
+                         data.recipient_id === chatContext.recipientId) ||
+                        (data.sender_id === chatContext.recipientId &&
+                         data.recipient_id === chatContext.currentUserId)) {
+
+                        // Игнорируем собственные сообщения, которые уже были добавлены как временные
+                        if (data.sender_id === chatContext.currentUserId) {
+                            console.log("Это наше сообщение, пропускаем добавление");
+                            return;
+                        }
+
+                        // Добавляем сообщение в чат
+                        addMessageToChat(data, false);
+
+                        // Помечаем как прочитанное, если это входящее сообщение
+                        if (data.sender_id === chatContext.recipientId) {
+                            markMessageAsRead(data.id);
+                        }
+
+                        // Прокручиваем вниз
+                        messageBox.scrollTop = messageBox.scrollHeight;
+
+                        // Воспроизводим звук для входящих сообщений
+                        if (data.sender_id === chatContext.recipientId) {
+                            playNotificationSound();
+                        }
+                    }
+                });
+
+                // Обработка подтверждения доставки
+                window.socket.on('message_delivered', function(data) {
+                    console.log('Подтверждение доставки:', data);
+                    const tempMsg = document.querySelector(`[data-temp-id="${data.temp_id}"]`);
+                    if (tempMsg) {
+                        // Заменяем временный ID на реальный
+                        tempMsg.id = `message-${data.message_id}`;
+                        tempMsg.removeAttribute('data-temp-id');
+                        const statusEl = tempMsg.querySelector('.delivery-status');
+                        if (statusEl) {
+                            statusEl.innerHTML = '<i class="bi bi-check"></i> Доставлено';
+                        }
+                    }
+                });
+
+                // Обработка обновления статуса прочтения
+                window.socket.on('message_read', function(data) {
+                    console.log('Статус прочтения обновлен:', data);
+                    const messageElement = document.getElementById(`message-${data.message_id}`);
+                    if (messageElement) {
+                        const statusEl = messageElement.querySelector('.delivery-status');
+                        if (statusEl) {
+                            statusEl.innerHTML = '<i class="bi bi-check2-all"></i> Прочитано';
+                            statusEl.classList.remove('text-muted');
+                            statusEl.classList.add('text-success');
+                        }
+                    }
+                });
+
+                // Обработка обновления присутствия
+                window.socket.on('update_presence', function(data) {
+                    console.log('Обновление присутствия:', data);
+                    // Обновляем статус онлайн пользователя
+                    updateOnlineStatus(data.user_id, true);
+                });
+
+                // Обработка отключения пользователя
+                window.socket.on('user_disconnected', function(data) {
+                    console.log('Пользователь отключился:', data);
+                    updateOnlineStatus(data.user_id, false);
+                });
+
+                // Присоединяемся к комнате чата
+                joinChatRoom();
+            } else {
+                console.warn("WebSocket недоступен, используется только HTTP");
+            }
+        }
+
+        // Функция обновления статуса онлайн
+        function updateOnlineStatus(userId, isOnline) {
+            const userElements = document.querySelectorAll(`[data-user-id="${userId}"]`);
+            userElements.forEach(element => {
+                const statusBadge = element.querySelector('.online-badge');
+                if (statusBadge) {
+                    statusBadge.style.display = isOnline ? 'block' : 'none';
+                }
+            });
+        }
     });
 </script>
+{% endblock %}
 
+{% block styles %}
 <style>
     .sent-message {
         background-color: #d1e7ff;
@@ -509,6 +810,58 @@
     .message-time {
         opacity: 0.7;
         font-size: 0.8rem;
+    }
+
+    /* Усиленное выделение активного чата */
+    .active-chat {
+        background-color: #e0f0ff !important;
+        border-left: 4px solid #0d6efd !important;
+        font-weight: 500;
+        z-index: 1;
+        box-shadow: 0 0 10px rgba(13, 110, 253, 0.2);
+    }
+
+    .list-group-item {
+        border-radius: 0;
+        border-left: none;
+        border-right: none;
+        transition: all 0.3s ease;
+    }
+
+    .user-avatar-sm {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background-color: #e9ecef;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+    }
+
+    .unread-badge {
+        position: absolute;
+        top: -5px;
+        right: -5px;
+    }
+
+    .online-badge {
+        position: absolute;
+        bottom: 0;
+        right: 0;
+        width: 10px;
+        height: 10px;
+        background-color: #28a745;
+        border-radius: 50%;
+        border: 2px solid white;
+        display: none;
+    }
+
+    /* Анимация обновления заголовка */
+    .chat-header-updating {
+        opacity: 0.7;
+        background-color: #f8f9fa;
+        transition: all 0.3s ease;
     }
 </style>
 {% endblock %}
